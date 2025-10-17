@@ -65,6 +65,8 @@ interface IOstiumVault {
     error DepositNotUnlocked(uint256 id);
     error PendingWithdrawal(address from, uint256 amount);
     error WrongLockDuration(uint256 duration, uint256 minLock, uint256 maxLock);
+    error SharesOutTooHigh(uint256 shares, uint256 maxSharesOut);
+    error AssetsInTooLow(uint256 assets, uint256 minAssetsIn);
 
     function tvl() external view returns (uint256);
     function currentEpoch() external view returns (uint16);
@@ -90,6 +92,12 @@ interface IOstiumVault {
         external
         returns (uint256);
     function unlockDeposit(uint256 depositId, address receiver) external;
+    function withdrawWithSlippage(uint256 assets, address receiver, address owner, uint256 maxSharesOut)
+        external
+        returns (uint256);
+    function redeemWithSlippage(uint256 shares, address receiver, address owner, uint256 minAssetsIn)
+        external
+        returns (uint256);
 
     // onlyGov
     function updateMaxAccOpenPnlDeltaPerToken(uint256 newValue) external;

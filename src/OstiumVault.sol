@@ -53,10 +53,10 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
     int256 public accPnlPerTokenUsed; // (snapshot of accPnlPerToken)
     int256 public dailyAccPnlDeltaPerToken;
 
-    uint256 public totalDeposited;
+    uint256 public totalDeposited; // Obsolete
     int256 public totalClosedPnl;
-    uint256 public totalRewards;
-    int256 public totalLiability;
+    uint256 public totalRewards; // Obsolete
+    int256 public totalLiability; // Obsolete
     uint256 public totalLockedDiscounts;
     uint256 public totalDiscounts;
 
@@ -100,6 +100,12 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         shareToAssetsPrice = PRECISION_18;
         currentEpochStart = uint32(block.timestamp);
         WITHDRAW_EPOCHS_LOCKS = [3, 2, 1];
+    }
+
+    function initializeV2() external reinitializer(2) {
+        totalLiability = 0;
+        totalDeposited = 0;
+        totalRewards = 0;
     }
 
     modifier onlyGov() {
@@ -208,9 +214,10 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
     function lockDiscountP(uint256 collatP, uint32 lockDuration) public view returns (uint256) {
         return (
             collatP <= uint16(100) * PRECISION_2
-                ? maxDiscountP
+                ? uint256(maxDiscountP) * 1e16
                 : collatP <= maxDiscountThresholdP
-                    ? maxDiscountP * (maxDiscountThresholdP - collatP) / (maxDiscountThresholdP - uint16(100) * PRECISION_2)
+                    ? uint256(maxDiscountP) * 1e16 * (maxDiscountThresholdP - collatP)
+                        / (maxDiscountThresholdP - uint16(100) * PRECISION_2)
                     : 0
         ) * lockDuration / MAX_LOCK_DURATION;
     }
@@ -332,7 +339,7 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         require(assets <= maxDeposit(receiver), 'ERC4626: deposit more than max');
 
         uint256 shares = previewDeposit(assets);
-        scaleVariables(shares, assets, true);
+        scaleVariables(shares, true);
 
         _deposit(_msgSender(), receiver, assets, shares);
         return shares;
@@ -342,7 +349,7 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         require(shares <= maxMint(receiver), 'ERC4626: mint more than max');
 
         uint256 assets = previewMint(shares);
-        scaleVariables(shares, assets, true);
+        scaleVariables(shares, true);
 
         _deposit(_msgSender(), receiver, assets, shares);
         return assets;
@@ -354,41 +361,52 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         checks(assets)
         returns (uint256)
     {
+        return withdrawWithSlippage(assets, receiver, owner, 0);
+    }
+
+    function redeem(uint256 shares, address receiver, address owner) public override checks(shares) returns (uint256) {
+        return redeemWithSlippage(shares, receiver, owner, 0);
+    }
+
+    function redeemWithSlippage(uint256 shares, address receiver, address owner, uint256 minAssetsIn)
+        public
+        checks(shares)
+        returns (uint256)
+    {
+        require(shares <= maxRedeem(owner), 'ERC4626: redeem more than max');
+        withdrawRequests[owner][currentEpoch] -= shares;
+        uint256 assets = previewRedeem(shares);
+        if (minAssetsIn != 0 && assets < minAssetsIn) revert AssetsInTooLow(assets, minAssetsIn);
+
+        scaleVariables(shares, false);
+        _withdraw(_msgSender(), receiver, owner, assets, shares);
+        return assets;
+    }
+
+    function withdrawWithSlippage(uint256 assets, address receiver, address owner, uint256 maxSharesOut)
+        public
+        checks(assets)
+        returns (uint256)
+    {
         require(assets <= maxWithdraw(owner), 'ERC4626: withdraw more than max');
 
         uint256 shares = previewWithdraw(assets);
+        if (maxSharesOut != 0 && shares > maxSharesOut) revert SharesOutTooHigh(shares, maxSharesOut);
         withdrawRequests[owner][currentEpoch] -= shares;
 
-        scaleVariables(shares, assets, false);
+        scaleVariables(shares, false);
 
         _withdraw(_msgSender(), receiver, owner, assets, shares);
         return shares;
     }
 
-    function redeem(uint256 shares, address receiver, address owner) public override checks(shares) returns (uint256) {
-        require(shares <= maxRedeem(owner), 'ERC4626: redeem more than max');
-
-        withdrawRequests[owner][currentEpoch] -= shares;
-
-        uint256 assets = previewRedeem(shares);
-        scaleVariables(shares, assets, false);
-
-        _withdraw(_msgSender(), receiver, owner, assets, shares);
-        return assets;
-    }
-
-    function scaleVariables(uint256 shares, uint256 assets, bool isDeposit) private {
+    function scaleVariables(uint256 shares, bool isDeposit) private {
         uint256 supply = totalSupply();
 
         if (accPnlPerToken < 0) {
             accPnlPerToken = accPnlPerToken * supply.toInt256()
                 / (isDeposit ? (supply + shares).toInt256() : (supply - shares).toInt256());
-        } else if (accPnlPerToken > 0) {
-            totalLiability +=
-                shares.toInt256() * totalLiability / supply.toInt256() * (isDeposit ? int256(1) : int256(-1));
         }
-
-        totalDeposited = isDeposit ? totalDeposited + assets : totalDeposited - assets;
     }
 
     function makeWithdrawRequest(uint256 shares, address owner) external {
@@ -436,7 +454,8 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         returns (uint256)
     {
         uint256 simulatedAssets = assets
-            * (PRECISION_2 * uint16(100) + lockDiscountP(collateralizationP(), lockDuration)) / (PRECISION_2 * uint16(100));
+            * (PRECISION_18 * uint256(100) + lockDiscountP(collateralizationP(), lockDuration))
+            / (PRECISION_18 * uint256(100));
 
         if (simulatedAssets > maxDeposit(receiver)) {
             revert AboveMaxDeposit();
@@ -456,15 +475,13 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         }
 
         uint256 assets = previewMint(shares);
+        uint256 multiplier = PRECISION_18 * uint256(100);
+        uint256 denominator = PRECISION_18 * uint256(100) + lockDiscountP(collateralizationP(), lockDuration);
 
-        return _executeDiscountAndLock(
-            assets,
-            assets * (PRECISION_2 * uint16(100))
-                / (PRECISION_2 * uint16(100) + lockDiscountP(collateralizationP(), lockDuration)),
-            shares,
-            lockDuration,
-            receiver
-        );
+        // Round up to ensure assetsDeposited > 0
+        uint256 assetsDeposited = Math.mulDiv(assets, multiplier, denominator, Math.Rounding.Ceil);
+
+        return _executeDiscountAndLock(assets, assetsDeposited, shares, lockDuration, receiver);
     }
 
     function _executeDiscountAndLock(
@@ -489,7 +506,7 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         d.atTimestamp = uint32(block.timestamp);
         d.lockDuration = lockDuration;
 
-        scaleVariables(shares, assetsDeposited, true);
+        scaleVariables(shares, true);
         address sender = _msgSender();
         _deposit(sender, address(this), assetsDeposited, shares);
 
@@ -531,7 +548,6 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         accPnlPerTokenUsed += accPnlDelta;
         updateShareToAssetsPrice();
 
-        totalLiability += d.assetsDiscount.toInt256();
         totalLockedDiscounts -= d.assetsDiscount;
 
         _transfer(address(this), receiver, d.shares);
@@ -546,7 +562,6 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         accRewardsPerToken += assets * PRECISION_18 / totalSupply();
         updateShareToAssetsPrice();
 
-        totalRewards += assets;
         emit RewardDistributed(sender, assets, accRewardsPerToken);
     }
 
@@ -567,7 +582,6 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
             revert MaxDailyPnlReached();
         }
 
-        totalLiability += assets.toInt256();
         totalClosedPnl += assets.toInt256();
 
         tryNewOpenPnlRequestOrEpoch();
@@ -588,7 +602,6 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         tryResetDailyAccPnlDelta();
         dailyAccPnlDeltaPerToken -= accPnlDelta;
 
-        totalLiability -= assets.toInt256();
         totalClosedPnl -= assets.toInt256();
 
         tryNewOpenPnlRequestOrEpoch();
@@ -619,7 +632,6 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
         delta = delta > maxDelta ? maxDelta : delta;
 
         accPnlPerToken += delta * int32(PRECISION_6) / supply.toInt256();
-        totalLiability += delta;
 
         accPnlPerTokenUsed = accPnlPerToken;
         updateShareToAssetsPrice();

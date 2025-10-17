@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 import './abstract/Delegatable.sol';
 import './lib/ChainUtils.sol';
+import './lib/TradingLib.sol';
 import './interfaces/IOstiumTrading.sol';
 import './interfaces/IOstiumRegistry.sol';
 import './interfaces/IOstiumPairInfos.sol';
 import './interfaces/IOstiumTradingCallbacks.sol';
 import './interfaces/IOstiumTradingStorage.sol';
 import './interfaces/IOstiumPriceRouter.sol';
-
 import '@openzeppelin/contracts/utils/math/Math.sol';
 import '@openzeppelin/contracts/utils/math/SafeCast.sol';
 import '@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol';
@@ -25,7 +25,8 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
     uint64 constant PRECISION_18 = 1e18;
     uint32 constant PRECISION_6 = 1e6;
     uint16 constant MAX_GAIN_P = 900;
-    uint16 constant MAX_SLIPPAGE_P = 10000;
+    uint16 constant PERCENT_BASE = 100e2; // 100% in precision 2 and also the MAX_SLIPPAGE_P
+    uint32 constant MAX_BUILDER_FEE_PERCENT = 500000; // 0.5% // PRECISION_6
 
     // Params (adjustable)
     uint256 public maxAllowedCollateral; // PRECISION_6
@@ -173,53 +174,32 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
 
     function openTrade(
         IOstiumTradingStorage.Trade calldata t,
+        IOstiumTradingStorage.BuilderFee calldata bf,
         IOstiumTradingStorage.OpenOrderType orderType,
         uint256 slippageP // for market orders only
     ) external notDone notPaused pairIndexListed(t.pairIndex) {
         address sender = _msgSender();
-        if (slippageP == 0 || slippageP >= MAX_SLIPPAGE_P || t.openPrice == 0) {
+        if (slippageP == 0 || slippageP >= PERCENT_BASE || t.openPrice == 0) {
+            revert WrongParams();
+        }
+
+        if (bf.builder != address(0) && bf.builderFee > MAX_BUILDER_FEE_PERCENT) {
             revert WrongParams();
         }
 
         IOstiumPairsStorage pairsStored = IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
         IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
+        IOstiumPairInfos pairInfos = IOstiumPairInfos(registry.getContractAddress('pairInfos'));
 
-        if (
-            storageT.openTradesCount(sender, t.pairIndex) + storageT.pendingMarketOpenCount(sender, t.pairIndex)
-                + storageT.openLimitOrdersCount(sender, t.pairIndex) >= storageT.maxTradesPerPair()
-        ) revert MaxTradesPerPairReached(sender, t.pairIndex);
-
-        if (storageT.pendingOrderIdsCount(sender) >= storageT.maxPendingMarketOrders()) {
-            revert MaxPendingMarketOrdersReached(sender);
-        }
-
-        if (
-            t.leverage == 0 || t.leverage < pairsStored.pairMinLeverage(t.pairIndex)
-                || t.leverage > pairsStored.pairMaxLeverage(t.pairIndex)
-        ) revert WrongLeverage(t.leverage);
-
-        if (t.collateral > maxAllowedCollateral) {
-            revert AboveMaxAllowedCollateral();
-        }
-
-        if (t.collateral * t.leverage / 100 < pairsStored.pairMinLevPos(t.pairIndex)) {
-            revert BelowMinLevPos();
-        }
-
-        if (t.tp != 0 && (t.buy ? t.tp <= t.openPrice : t.tp >= t.openPrice)) {
-            revert WrongTP();
-        }
-
-        if (t.sl != 0 && (t.buy ? t.sl >= t.openPrice : t.sl <= t.openPrice)) {
-            revert WrongSL();
-        }
+        (uint32 makerFeeP, uint32 takerFeeP,,,,) = pairInfos.pairOpeningFees(t.pairIndex);
+        TradingLib.getOpenTradeRevert(storageT, pairsStored, sender, t, maxAllowedCollateral, takerFeeP, makerFeeP, bf);
 
         storageT.transferUsdc(sender, address(storageT), t.collateral);
 
         if (orderType != IOstiumTradingStorage.OpenOrderType.MARKET) {
             uint8 index = storageT.firstEmptyOpenLimitIndex(sender, t.pairIndex);
 
-            uint32 b = ChainUtils.getBlockNumber().toUint32();
+            uint32 currTimestamp = block.timestamp.toUint32();
             storageT.storeOpenLimitOrder(
                 IOstiumTradingStorage.OpenLimitOrder(
                     t.collateral,
@@ -228,13 +208,14 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
                     t.sl,
                     sender,
                     t.leverage,
-                    b,
-                    b,
+                    currTimestamp,
+                    currTimestamp,
                     t.pairIndex,
                     orderType,
                     index,
                     t.buy
-                )
+                ),
+                bf
             );
 
             emit OpenLimitPlaced(sender, t.pairIndex, index);
@@ -252,73 +233,64 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
                     0
                 ),
                 orderId,
-                true
+                true,
+                bf
             );
 
             emit MarketOpenOrderInitiated(orderId, sender, t.pairIndex);
         }
     }
 
-    function closeTradeMarket(uint16 pairIndex, uint8 index, uint16 closePercentage) external notDone {
+    function closeTradeMarket(
+        uint16 pairIndex,
+        uint8 index,
+        uint16 closePercentage,
+        uint192 marketPrice,
+        uint32 slippageP
+    ) external notDone {
         IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
         IOstiumPairsStorage pairsStorage = IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
 
         address sender = _msgSender();
 
-        if (closePercentage > 100e2) {
+        if (closePercentage > PERCENT_BASE) {
+            revert WrongParams();
+        }
+
+        if (marketPrice == 0 || slippageP == 0 || slippageP > PERCENT_BASE) {
             revert WrongParams();
         }
 
         if (closePercentage == 0) {
-            closePercentage = 100e2;
+            closePercentage = PERCENT_BASE;
         }
 
         IOstiumTradingStorage.Trade memory t = storageT.getOpenTrade(sender, pairIndex, index);
-
-        if (t.leverage == 0) {
-            revert NoTradeFound(sender, pairIndex, index);
-        }
-
-        if (storageT.pendingOrderIdsCount(sender) >= storageT.maxPendingMarketOrders()) {
-            revert MaxPendingMarketOrdersReached(sender);
-        }
-
-        if (!checkNoPendingTriggers(sender, pairIndex, index)) {
-            revert TriggerPending(sender, pairIndex, index);
-        }
-
         IOstiumTradingStorage.TradeInfo memory i = storageT.getOpenTradeInfo(sender, pairIndex, index);
 
-        if (i.beingMarketClosed) {
-            revert AlreadyMarketClosed(sender, t.pairIndex, t.index);
-        }
-
-        // Calculate remaining position size after partial close
-        uint256 remainingCollateral = t.collateral * (100e2 - closePercentage) / 100e2;
-
-        // Check if remaining position remains above minimum
-        if (closePercentage != 100e2 && remainingCollateral * t.leverage / 100 < pairsStorage.pairMinLevPos(pairIndex))
-        {
-            revert BelowMinLevPos();
-        }
-
-        if (closePercentage != 100e2) {
-            uint256 oracleFee = pairsStorage.pairOracleFee(pairIndex);
-            storageT.transferUsdc(sender, address(storageT), oracleFee);
-            storageT.handleOracleFee(oracleFee);
-            emit OracleFeeCharged(i.tradeId, sender, pairIndex, oracleFee);
-        }
+        TradingLib.getCloseTradeRevert(storageT, pairsStorage, sender, t, i, triggerTimeout, closePercentage);
 
         uint256 orderId = IOstiumPriceRouter(registry.getContractAddress('priceRouter')).getPrice(
             pairIndex, IOstiumPriceUpKeep.OrderType.MARKET_CLOSE, block.timestamp
         );
 
+        // Always charge oracle fee for both partial and full closes to prevent griefing
+        uint256 oracleFee = pairsStorage.pairOracleFee(pairIndex);
+        storageT.transferUsdc(sender, address(storageT), oracleFee);
+        storageT.handleOracleFee(oracleFee);
+        emit OracleFeeCharged(orderId, sender, pairIndex, oracleFee);
+
         storageT.storePendingMarketOrder(
             IOstiumTradingStorage.PendingMarketOrderV2(
-                0, 0, 0, IOstiumTradingStorage.Trade(0, 0, 0, 0, sender, 0, pairIndex, index, t.buy), closePercentage
+                0,
+                marketPrice,
+                slippageP,
+                IOstiumTradingStorage.Trade(0, 0, 0, 0, sender, 0, pairIndex, index, t.buy),
+                closePercentage
             ),
             orderId,
-            false
+            false,
+            IOstiumTradingStorage.BuilderFee(address(0), 0)
         );
 
         emit MarketCloseOrderInitiatedV2(orderId, i.tradeId, sender, pairIndex, closePercentage);
@@ -341,21 +313,11 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
 
         IOstiumTradingStorage.OpenLimitOrder memory o = storageT.getOpenLimitOrder(sender, pairIndex, index);
 
-        if (tp != 0 && (o.buy ? tp <= price : tp >= price)) {
-            revert WrongTP();
-        }
-
-        if (sl != 0 && (o.buy ? sl >= price : sl <= price)) {
-            revert WrongSL();
-        }
-
-        if (!checkNoPendingTrigger(sender, pairIndex, index, IOstiumTradingStorage.LimitOrder.OPEN)) {
-            revert TriggerPending(sender, pairIndex, index);
-        }
-
         o.targetPrice = price;
         o.tp = tp;
         o.sl = sl;
+
+        TradingLib.getUpdateOpenLimitOrderRevert(storageT, sender, o, pairIndex, index, triggerTimeout);
 
         storageT.updateOpenLimitOrder(o);
 
@@ -366,13 +328,7 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
         address sender = _msgSender();
         IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
 
-        if (!storageT.hasOpenLimitOrder(sender, pairIndex, index)) {
-            revert NoLimitFound(sender, pairIndex, index);
-        }
-
-        if (!checkNoPendingTrigger(sender, pairIndex, index, IOstiumTradingStorage.LimitOrder.OPEN)) {
-            revert TriggerPending(sender, pairIndex, index);
-        }
+        TradingLib.getCancelOpenLimitOrderRevert(storageT, sender, pairIndex, index, triggerTimeout);
 
         IOstiumTradingStorage.OpenLimitOrder memory o = storageT.getOpenLimitOrder(sender, pairIndex, index);
 
@@ -394,7 +350,11 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
         address sender = _msgSender();
         IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
 
-        if (!checkNoPendingTrigger(sender, pairIndex, index, IOstiumTradingStorage.LimitOrder.TP)) {
+        if (
+            !TradingLib.checkNoPendingTrigger(
+                storageT, sender, pairIndex, index, IOstiumTradingStorage.LimitOrder.TP, triggerTimeout
+            )
+        ) {
             revert TriggerPending(sender, pairIndex, index);
         }
 
@@ -425,7 +385,11 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
         IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
 
         address sender = _msgSender();
-        if (!checkNoPendingTrigger(sender, pairIndex, index, IOstiumTradingStorage.LimitOrder.SL)) {
+        if (
+            !TradingLib.checkNoPendingTrigger(
+                storageT, sender, pairIndex, index, IOstiumTradingStorage.LimitOrder.SL, triggerTimeout
+            )
+        ) {
             revert TriggerPending(sender, pairIndex, index);
         }
 
@@ -458,11 +422,8 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
         if (topUpAmount == 0) {
             revert WrongParams();
         }
-        if (!checkNoPendingTriggers(t.trader, t.pairIndex, t.index)) {
+        if (!TradingLib.checkNoPendingTriggers(storageT, t.trader, t.pairIndex, t.index, triggerTimeout)) {
             revert TriggerPending(t.trader, t.pairIndex, t.index);
-        }
-        if (pairsStorage.groupCollateral(pairIndex, t.buy) + topUpAmount > pairsStorage.groupMaxCollateral(pairIndex)) {
-            revert ExposureLimits();
         }
         uint256 tradeSize = t.collateral.mulDiv(t.leverage, 100, Math.Rounding.Ceil);
         uint256 newCollateral = t.collateral + topUpAmount;
@@ -477,6 +438,9 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
             } else {
                 revert WrongParams();
             }
+        }
+        if (pairsStorage.groupCollateral(pairIndex, t.buy) + topUpAmount > pairsStorage.groupMaxCollateral(pairIndex)) {
+            revert ExposureLimits();
         }
         if (newCollateral > maxAllowedCollateral) {
             revert AboveMaxAllowedCollateral();
@@ -511,7 +475,7 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
         if (removeAmount == 0 || removeAmount >= t.collateral) {
             revert WrongParams();
         }
-        if (!checkNoPendingTriggers(t.trader, t.pairIndex, t.index)) {
+        if (!TradingLib.checkNoPendingTriggers(storageT, t.trader, t.pairIndex, t.index, triggerTimeout)) {
             revert TriggerPending(t.trader, t.pairIndex, t.index);
         }
         uint256 tradeSize = t.collateral.mulDiv(t.leverage, 100, Math.Rounding.Ceil);
@@ -567,20 +531,36 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
                 return IOstiumTrading.AutomationOrderStatus.NO_LIMIT;
             }
             isNotPaused();
+
+            IOstiumTradingStorage.OpenLimitOrder memory openOrder = storageT.getOpenLimitOrder(trader, pairIndex, index);
+            if (priceTimestamp < openOrder.createdAt) {
+                return IOstiumTrading.AutomationOrderStatus.BACKDATED_EXECUTION;
+            }
         } else {
             t = storageT.getOpenTrade(trader, pairIndex, index);
+            IOstiumTradingStorage.TradeInfo memory tInfo = storageT.getOpenTradeInfo(trader, pairIndex, index);
 
             if (t.leverage == 0) return IOstiumTrading.AutomationOrderStatus.NO_TRADE;
 
-            if (orderType == IOstiumTradingStorage.LimitOrder.SL && t.sl == 0) {
+            if (priceTimestamp < tInfo.createdAt) {
+                return IOstiumTrading.AutomationOrderStatus.BACKDATED_EXECUTION;
+            }
+
+            if (
+                orderType == IOstiumTradingStorage.LimitOrder.SL
+                    && (t.sl == 0 || (t.sl != 0 && tInfo.slLastUpdated > priceTimestamp))
+            ) {
                 return IOstiumTrading.AutomationOrderStatus.NO_SL;
             }
-            if (orderType == IOstiumTradingStorage.LimitOrder.TP && t.tp == 0) {
+            if (
+                orderType == IOstiumTradingStorage.LimitOrder.TP
+                    && (t.tp == 0 || (t.tp != 0 && tInfo.tpLastUpdated > priceTimestamp))
+            ) {
                 return IOstiumTrading.AutomationOrderStatus.NO_TP;
             }
         }
 
-        if (!checkNoPendingTrigger(trader, pairIndex, index, orderType)) {
+        if (!TradingLib.checkNoPendingTrigger(storageT, trader, pairIndex, index, orderType, triggerTimeout)) {
             return IOstiumTrading.AutomationOrderStatus.PENDING_TRIGGER;
         }
 
@@ -677,24 +657,27 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
 
         uint256 tradeId = storageT.getOpenTradeInfo(sender, trade.pairIndex, trade.index).tradeId;
 
-        bool success = false;
         if (retry) {
-            (success,) = address(this).delegatecall(
+            (bool success,) = address(this).delegatecall(
                 abi.encodeWithSignature(
-                    'closeTradeMarket(uint16,uint8,uint16)', trade.pairIndex, trade.index, percentage
+                    'closeTradeMarket(uint16,uint8,uint16,uint192,uint32)',
+                    trade.pairIndex,
+                    trade.index,
+                    percentage,
+                    wantedPrice,
+                    slippageP
                 )
             );
             if (!success) {
                 emit MarketCloseFailed(tradeId, sender, trade.pairIndex);
             }
         }
-        if (!success && percentage != 100e2) {
-            uint256 oracleFee =
-                IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairOracleFee(trade.pairIndex);
-            storageT.refundOracleFee(oracleFee);
-            storageT.transferUsdc(address(storageT), sender, oracleFee);
-            emit OracleFeeRefunded(tradeId, sender, trade.pairIndex, oracleFee);
-        }
+        // Always refund oracle fee regardless of partial or full close
+        uint256 oracleFee =
+            IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairOracleFee(trade.pairIndex);
+        storageT.refundOracleFee(oracleFee);
+        storageT.transferUsdc(address(storageT), sender, oracleFee);
+        emit OracleFeeRefunded(_order, sender, trade.pairIndex, oracleFee);
 
         emit MarketCloseTimeoutExecutedV2(
             _order,
@@ -707,29 +690,5 @@ contract OstiumTrading is IOstiumTrading, Delegatable, Initializable {
                 percentage: percentage
             })
         );
-    }
-
-    function checkNoPendingTrigger(
-        address trader,
-        uint16 pairIndex,
-        uint8 index,
-        IOstiumTradingStorage.LimitOrder orderType
-    ) public view returns (bool) {
-        uint256 triggerBlock = IOstiumTradingStorage(registry.getContractAddress('tradingStorage')).orderTriggerBlock(
-            trader, pairIndex, index, orderType
-        );
-
-        if (triggerBlock == 0 || (triggerBlock > 0 && ChainUtils.getBlockNumber() - triggerBlock >= triggerTimeout)) {
-            return true;
-        }
-        return false;
-    }
-
-    function checkNoPendingTriggers(address trader, uint16 pairIndex, uint8 index) public view returns (bool) {
-        return checkNoPendingTrigger(trader, pairIndex, index, IOstiumTradingStorage.LimitOrder.TP)
-            && checkNoPendingTrigger(trader, pairIndex, index, IOstiumTradingStorage.LimitOrder.SL)
-            && checkNoPendingTrigger(trader, pairIndex, index, IOstiumTradingStorage.LimitOrder.LIQ)
-            && checkNoPendingTrigger(trader, pairIndex, index, IOstiumTradingStorage.LimitOrder.CLOSE_DAY_TRADE)
-            && checkNoPendingTrigger(trader, pairIndex, index, IOstiumTradingStorage.LimitOrder.REMOVE_COLLATERAL);
     }
 }

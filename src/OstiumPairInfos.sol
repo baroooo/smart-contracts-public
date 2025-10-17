@@ -25,7 +25,7 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
 
     uint64 constant PRECISION_18 = 1e18; // 18 decimals
     uint64 constant MAX_FUNDING_FEE = 95129375951; // 1000% annum, PRECISION_18
-    uint64 constant MAX_ROLLOVER_FEE = 28538812785; // 300% annum, PRECISION_18
+    uint64 constant MAX_ROLLOVER_FEE_PER_BLOCK = 28538812785; // 300% annum, PRECISION_18
     uint64 constant MAX_FR_SPRING_FACTOR = PRECISION_18; // PRECISION_2
     uint64 constant PADE_ERROR_THRESHOLD = 793231258909201900; // PRECISION_18
     uint64 constant POWERTWO_APPROX_THRESHOLD = 6906000000000000000; // PRECISION_18
@@ -33,9 +33,8 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
     uint32 constant PRECISION_6 = 1e6; // 6 decimals
     uint32 constant PRECISION_4 = 1e4;
     uint32 constant MAX_FEEP = 10000000; // 10%, PRECISION_6,
-    uint32 constant MAX_ROLLOVER_VOLATILITY = 10000000; // 10%, PRECISION_6
+    uint64 constant MAX_BROKER_PREMIUM_PER_BLOCK = 951293760; // 10% annum, PRECISION_18
 
-    uint16 constant MAX_ROLLOVER_FEE_SLOPE = 1000; // PRECISION_2
     uint16 constant MAX_USAGE_THRESHOLDP = 10000; // 100%, PRECISION_2
     uint16 constant MAX_MAKER_LEVERAGE = 10000; // PRECISION_2
     uint16 constant MAX_HILL_SCALE = 250; // PRECISION_2
@@ -43,14 +42,24 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
     uint8 constant PRECISION_2 = 1e2; // 2 decimals
     uint8 constant MAX_LIQ_MARGIN_THRESHOLD_P = 50;
 
+    // Dynamic spread parameter limits
+    uint256 constant MAX_NET_VOL_THRESHOLD = 10_000_000_000e18; // PRECISION_18 // 10 Billion
+    uint128 constant MIN_DECAY_RATE = 1e14; // PRECISION_18
+    uint128 constant MAX_DECAY_RATE = PRECISION_18; // 1 with 18 decimals
+    uint256 constant MIN_PRICE_IMPACT_K = 1e5; // PRECISION_27 // 1e-22
+    uint256 constant MAX_PRICE_IMPACT_K = 1e12; // PRECISION_27 // 1e-15
+
     uint8 public liqMarginThresholdP; // e.g., set to 25 (25%)
     uint8 public maxNegativePnlOnOpenP; // (%)
 
     mapping(uint16 pairIndex => PairOpeningFees) public pairOpeningFees;
     mapping(uint16 pairIndex => PairFundingFeesV2) public pairFundingFees;
-    mapping(uint16 pairIndex => PairRolloverFees) public pairRolloverFees;
+    mapping(uint16 pairIndex => PairRolloverFees) public pairRolloverFeesV1;
     mapping(address trader => mapping(uint16 pairIndex => mapping(uint8 tradeIndex => TradeInitialAccFees))) public
         tradeInitialAccFees;
+    mapping(uint16 pairIndex => PairRolloverFeesV2) public pairRolloverFeesV2;
+    mapping(uint16 pairIndex => DynamicSpreadParams) public pairDynamicSpreadParams;
+    mapping(uint16 pairIndex => DynamicSpreadState) public pairDynamicSpreadState;
 
     constructor() {
         _disableInitializers();
@@ -100,6 +109,13 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
     function initializeV3(uint256 _liqMarginThresholdP, uint256 _maxNegativePnlOnOpenP) external reinitializer(3) {
         _setLiqMarginThresholdP(_liqMarginThresholdP);
         _setMaxNegativePnlOnOpenP(_maxNegativePnlOnOpenP);
+    }
+
+    function initializeV4(uint16[] calldata pairIds, int256[] calldata lastLongPures, uint256[] calldata brokerPremiums)
+        external
+        reinitializer(4)
+    {
+        migrateRolloverFeesV2(pairIds, lastLongPures, brokerPremiums);
     }
 
     // Modifiers
@@ -196,7 +212,7 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         emit VaultFeePercentUpdated(pairIndex, value);
     }
 
-    function setPairOpeningVaultFeePercentArray(uint16[] calldata indices, uint8[] calldata values) public onlyGov {
+    function setPairOpeningVaultFeePercentArray(uint16[] calldata indices, uint8[] calldata values) external onlyGov {
         if (indices.length != values.length) revert WrongParams();
 
         for (uint256 i = 0; i < indices.length; i++) {
@@ -204,38 +220,10 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         }
     }
 
-    function setRolloverFeePerBlock(uint16 pairIndex, uint256 volatility) public onlyManager {
-        if (volatility >= pairRolloverFees[pairIndex].maxRolloverVolatility) revert WrongParams();
-
-        storeAccRolloverFees(pairIndex);
-
-        uint256 maxRolloverFeePerBlock = pairRolloverFees[pairIndex].maxRolloverFeePerBlock;
-        uint256 maxRolloverVolatility = pairRolloverFees[pairIndex].maxRolloverVolatility;
-        uint16 rolloverFeeSlope = pairRolloverFees[pairIndex].rolloverFeeSlope;
-
-        uint256 numerator =
-            maxRolloverVolatility * rolloverFeeSlope / PRECISION_2 * (rolloverFeeSlope - PRECISION_2) / PRECISION_2;
-        uint256 denominator = (maxRolloverVolatility * rolloverFeeSlope / PRECISION_2) - volatility;
-        int256 tmp = ((numerator * PRECISION_6 / denominator) + PRECISION_6).toInt256()
-            - (rolloverFeeSlope * PRECISION_4).toInt256();
-        if (tmp >= 0) {
-            pairRolloverFees[pairIndex].rolloverFeePerBlock =
-                ((maxRolloverFeePerBlock * tmp.toUint256()) / PRECISION_6).toUint64();
-        }
-        emit RolloverFeePerBlockUpdated(pairIndex, pairRolloverFees[pairIndex].rolloverFeePerBlock, volatility);
-    }
-
-    function setRolloverFeePerBlockArray(uint16[] calldata indices, uint256[] calldata values) external onlyManager {
-        if (indices.length != values.length) revert WrongParams();
-
-        for (uint256 i = 0; i < indices.length; i++) {
-            setRolloverFeePerBlock(indices[i], values[i]);
-        }
-    }
-
     function setPairFundingFees(uint16 pairIndex, PairFundingFeesV2 calldata value) public onlyGov {
         if (
             value.maxFundingFeePerBlock > MAX_FUNDING_FEE || value.hillInflectionPoint.abs() > PRECISION_18
+                || uint256(value.springFactor) == 0
                 || uint256(value.springFactor) * value.sFactorUpScaleP / 100e2 > MAX_FR_SPRING_FACTOR
                 || value.hillPosScale > MAX_HILL_SCALE || value.hillNegScale > MAX_HILL_SCALE
                 || value.sFactorUpScaleP < 100e2 || value.sFactorDownScaleP > 100e2
@@ -304,27 +292,33 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         }
     }
 
-    function setPairRolloverFees(uint16 pairIndex, PairRolloverFees calldata value) public onlyGov {
+    function setPairRolloverFees(uint16 pairIndex, PairRolloverFeesV2 calldata value) public onlyGov {
         if (
-            value.maxRolloverVolatility > MAX_ROLLOVER_VOLATILITY || value.maxRolloverFeePerBlock > MAX_ROLLOVER_FEE
-                || value.rolloverFeeSlope <= PRECISION_2 || value.rolloverFeeSlope > MAX_ROLLOVER_FEE_SLOPE
+            value.maxRolloverFeePerBlock > MAX_ROLLOVER_FEE_PER_BLOCK
+                || value.lastLongPure.abs() + value.brokerPremium > value.maxRolloverFeePerBlock
+                || value.brokerPremium > MAX_BROKER_PREMIUM_PER_BLOCK
         ) {
             revert WrongParams();
         }
 
-        if (pairRolloverFees[pairIndex].lastUpdateBlock != 0) {
+        PairRolloverFeesV2 storage p = pairRolloverFeesV2[pairIndex];
+
+        if (p.lastUpdateBlock != 0) {
             storeAccRolloverFees(pairIndex);
         }
 
-        PairRolloverFees storage p = pairRolloverFees[pairIndex];
-        p.maxRolloverVolatility = value.maxRolloverVolatility;
         p.maxRolloverFeePerBlock = value.maxRolloverFeePerBlock;
-        p.rolloverFeeSlope = value.rolloverFeeSlope;
-
-        emit PairRolloverFeesUpdated(pairIndex, value);
+        p.lastLongPure = value.lastLongPure;
+        p.brokerPremium = value.brokerPremium;
+        p.lastUpdateBlock = ChainUtils.getBlockNumber().toUint32();
+        p.isNegativeRolloverAllowed = value.isNegativeRolloverAllowed;
+        emit PairRolloverFeesUpdatedV2(pairIndex, value);
     }
 
-    function setPairRolloverFeesArray(uint16[] calldata indices, PairRolloverFees[] calldata values) external onlyGov {
+    function setPairRolloverFeesArray(uint16[] calldata indices, PairRolloverFeesV2[] calldata values)
+        external
+        onlyGov
+    {
         if (indices.length != values.length) revert WrongParams();
 
         for (uint256 i = 0; i < indices.length; i++) {
@@ -332,57 +326,29 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         }
     }
 
+    /**
+     * @notice DEPRECATED - The function setMaxRolloverFeePerBlockV1 will be removed in the next contract upgrade
+     * @dev Migration testing only - remove after confirming data migration works
+     * TODO: Remove in next upgrade once migration is verified
+     */
+    function setMaxRolloverFeePerBlockV1(uint16 pairIndex, uint256 value) public onlyGov {
+        if (value > MAX_ROLLOVER_FEE_PER_BLOCK) revert WrongParams();
+        pairRolloverFeesV1[pairIndex].maxRolloverFeePerBlock = value.toUint64();
+    }
+
     function setMaxRolloverFeePerBlock(uint16 pairIndex, uint256 value) public onlyGov {
-        if (value > MAX_ROLLOVER_FEE) revert WrongParams();
+        if (value > MAX_ROLLOVER_FEE_PER_BLOCK) revert WrongParams();
 
         storeAccRolloverFees(pairIndex);
 
-        pairRolloverFees[pairIndex].maxRolloverFeePerBlock = value.toUint64();
-
+        pairRolloverFeesV2[pairIndex].maxRolloverFeePerBlock = value.toUint64();
         emit MaxRolloverFeePerBlockUpdated(pairIndex, value);
     }
 
     function setMaxRolloverFeePerBlockArray(uint16[] calldata indices, uint256[] calldata values) external onlyGov {
         if (indices.length != values.length) revert WrongParams();
-
         for (uint256 i = 0; i < indices.length; i++) {
             setMaxRolloverFeePerBlock(indices[i], values[i]);
-        }
-    }
-
-    function setMaxRolloverVolatility(uint16 pairIndex, uint256 value) public onlyGov {
-        if (value > MAX_ROLLOVER_VOLATILITY) revert WrongParams();
-
-        storeAccRolloverFees(pairIndex);
-
-        pairRolloverFees[pairIndex].maxRolloverVolatility = value.toUint32();
-
-        emit MaxRolloverVolatilityUpdated(pairIndex, value);
-    }
-
-    function setMaxRolloverVolatilityArray(uint16[] calldata indices, uint256[] calldata values) external onlyGov {
-        if (indices.length != values.length) revert WrongParams();
-
-        for (uint256 i = 0; i < indices.length; i++) {
-            setMaxRolloverVolatility(indices[i], values[i]);
-        }
-    }
-
-    function setRolloverFeeSlope(uint16 pairIndex, uint256 value) public onlyGov {
-        if (value > MAX_ROLLOVER_FEE_SLOPE || value <= PRECISION_2) revert WrongParams();
-
-        storeAccRolloverFees(pairIndex);
-
-        pairRolloverFees[pairIndex].rolloverFeeSlope = value.toUint16();
-
-        emit MaxRolloverFeeSlopeUpdated(pairIndex, value);
-    }
-
-    function setRolloverFeeSlopeArray(uint16[] calldata indices, uint256[] calldata values) external onlyGov {
-        if (indices.length != values.length) revert WrongParams();
-
-        for (uint256 i = 0; i < indices.length; i++) {
-            setRolloverFeeSlope(indices[i], values[i]);
         }
     }
 
@@ -404,19 +370,141 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         }
     }
 
+    function updatePairBrokerPremium(uint16 pairId, uint256 premium) public onlyGov {
+        PairRolloverFeesV2 storage r = pairRolloverFeesV2[pairId];
+
+        if (r.lastUpdateBlock == 0) revert WrongParams();
+
+        if (premium > MAX_BROKER_PREMIUM_PER_BLOCK || r.lastLongPure.abs() + premium > r.maxRolloverFeePerBlock) {
+            revert WrongParams();
+        }
+
+        storeAccRolloverFees(pairId);
+
+        r.brokerPremium = premium;
+        emit BrokerPremiumUpdated(pairId, premium);
+    }
+
+    function updatePairBrokerPremiumArray(uint16[] calldata pairIds, uint256[] calldata premiums) external onlyGov {
+        if (pairIds.length != premiums.length) revert WrongParams();
+        for (uint256 i = 0; i < pairIds.length; i++) {
+            updatePairBrokerPremium(pairIds[i], premiums[i]);
+        }
+    }
+
+    function setPairIsNegativeRolloverAllowed(uint16 pairIndex, bool value) public onlyGov {
+        storeAccRolloverFees(pairIndex);
+
+        pairRolloverFeesV2[pairIndex].isNegativeRolloverAllowed = value;
+        emit PairIsNegativeRolloverAllowedUpdated(pairIndex, value);
+    }
+
+    function setPairIsNegativeRolloverAllowedArray(uint16[] calldata indices, bool[] calldata values)
+        external
+        onlyGov
+    {
+        if (indices.length != values.length) revert WrongParams();
+
+        for (uint256 i = 0; i < indices.length; i++) {
+            setPairIsNegativeRolloverAllowed(indices[i], values[i]);
+        }
+    }
+
+    function updateRolloverFees(uint16 pairId, int256 pureLongFee) public onlyManager {
+        PairRolloverFeesV2 storage r = pairRolloverFeesV2[pairId];
+        uint256 absRolloverFee = uint256(pureLongFee > 0 ? pureLongFee : -pureLongFee);
+
+        if (absRolloverFee + r.brokerPremium > r.maxRolloverFeePerBlock) {
+            revert WrongParams();
+        }
+
+        storeAccRolloverFees(pairId);
+        r.lastLongPure = pureLongFee;
+
+        emit RolloverFeesUpdateSuccess(pairId, pureLongFee);
+    }
+
+    function storeAccRolloverFees(uint16 pairId) internal {
+        PairRolloverFeesV2 storage r = pairRolloverFeesV2[pairId];
+
+        r.accPerOiLong = getPendingAccRolloverFees(pairId, true);
+        r.accPerOiShort = getPendingAccRolloverFees(pairId, false);
+        r.lastUpdateBlock = ChainUtils.getBlockNumber().toUint32();
+
+        emit AccRolloverFeesStoredV2(pairId, r.accPerOiLong, r.accPerOiShort, r.lastUpdateBlock);
+    }
+
+    function updateRolloverFeesArray(uint16[] calldata pairIds, int256[] calldata pureLongFees) external onlyManager {
+        if (pairIds.length != pureLongFees.length) revert WrongParams();
+        for (uint256 i = 0; i < pairIds.length; i++) {
+            updateRolloverFees(pairIds[i], pureLongFees[i]);
+        }
+    }
+
+    function getPairRolloverFees(uint16 pairId) external view returns (int256, int256, int256, uint256, uint32, bool) {
+        PairRolloverFeesV2 storage r = pairRolloverFeesV2[pairId];
+        return (
+            r.accPerOiLong,
+            r.accPerOiShort,
+            r.lastLongPure,
+            r.brokerPremium,
+            r.lastUpdateBlock,
+            r.isNegativeRolloverAllowed
+        );
+    }
+
+    function migrateRolloverFeesV2(
+        uint16[] calldata pairIds,
+        int256[] calldata lastLongPures,
+        uint256[] calldata brokerPremiums
+    ) private {
+        if (pairIds.length != lastLongPures.length || pairIds.length != brokerPremiums.length) {
+            revert WrongParams();
+        }
+
+        for (uint256 i = 0; i < pairIds.length; i++) {
+            uint16 pairId = pairIds[i];
+            PairRolloverFees memory oldR = pairRolloverFeesV1[pairId];
+
+            if (
+                oldR.maxRolloverFeePerBlock > MAX_ROLLOVER_FEE_PER_BLOCK
+                    || lastLongPures[i].abs() + brokerPremiums[i] > oldR.maxRolloverFeePerBlock
+                    || brokerPremiums[i] > MAX_BROKER_PREMIUM_PER_BLOCK
+            ) {
+                revert WrongParams();
+            }
+            oldR.accPerOi =
+                oldR.accPerOi + (ChainUtils.getBlockNumber() - oldR.lastUpdateBlock) * oldR.rolloverFeePerBlock;
+            pairRolloverFeesV2[pairId].accPerOiLong = int256(oldR.accPerOi);
+            pairRolloverFeesV2[pairId].accPerOiShort = int256(oldR.accPerOi);
+            pairRolloverFeesV2[pairId].maxRolloverFeePerBlock = oldR.maxRolloverFeePerBlock;
+            pairRolloverFeesV2[pairId].lastLongPure = lastLongPures[i];
+            pairRolloverFeesV2[pairId].brokerPremium = brokerPremiums[i];
+            pairRolloverFeesV2[pairId].lastUpdateBlock = ChainUtils.getBlockNumber().toUint32();
+            pairRolloverFeesV2[pairId].isNegativeRolloverAllowed = false;
+            emit PairRolloverFeesUpdatedV2(pairId, pairRolloverFeesV2[pairId]);
+        }
+        emit MigrationV4Completed(pairIds.length, block.timestamp);
+    }
+
     function storeTradeInitialAccFees(uint256 tradeId, address trader, uint16 pairIndex, uint8 index, bool long)
         external
         onlyCallbacks
     {
         storeAccFundingFees(pairIndex);
+        storeAccRolloverFees(pairIndex);
 
         TradeInitialAccFees storage t = tradeInitialAccFees[trader][pairIndex][index];
 
-        t.rollover = getPendingAccRolloverFees(pairIndex);
-
+        int256 rollover =
+            long ? pairRolloverFeesV2[pairIndex].accPerOiLong : pairRolloverFeesV2[pairIndex].accPerOiShort;
+        t.isRolloverSignNegative = rollover < 0;
+        t.rollover = rollover.abs();
         t.funding = long ? pairFundingFees[pairIndex].accPerOiLong : pairFundingFees[pairIndex].accPerOiShort;
 
-        emit TradeInitialAccFeesStored(tradeId, trader, pairIndex, index, t.rollover, t.funding);
+        emit TradeInitialAccFeesStoredV2(
+            tradeId, trader, pairIndex, index, rollover, t.isRolloverSignNegative, t.funding
+        );
     }
 
     function getOpeningFee(uint16 pairIndex, int256 leveragedPositionSize, uint32 leverage, int256 oiDelta)
@@ -453,20 +541,19 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
             / PRECISION_6 / 100;
     }
 
-    function storeAccRolloverFees(uint16 pairIndex) private {
-        PairRolloverFees storage r = pairRolloverFees[pairIndex];
+    function getPendingAccRolloverFees(uint16 pairIndex, bool long) public view returns (int256) {
+        PairRolloverFeesV2 memory r = pairRolloverFeesV2[pairIndex];
 
-        r.accPerOi = getPendingAccRolloverFees(pairIndex);
-        r.lastUpdateBlock = ChainUtils.getBlockNumber().toUint32();
+        int256 currentAccRolloverFee = long ? r.accPerOiLong : r.accPerOiShort;
+        uint32 blockDelta = ChainUtils.getBlockNumber().toUint32() - r.lastUpdateBlock;
+        int256 rolloverFeePerBlock = (long ? r.lastLongPure : -r.lastLongPure) + int256(r.brokerPremium);
 
-        emit AccRolloverFeesStored(pairIndex, r.accPerOi);
-    }
+        if (!r.isNegativeRolloverAllowed) {
+            rolloverFeePerBlock = rolloverFeePerBlock >= 0 ? rolloverFeePerBlock : int256(0);
+        }
+        currentAccRolloverFee += rolloverFeePerBlock * int256(uint256(blockDelta));
 
-    function getPendingAccRolloverFees(uint16 pairIndex) public view returns (uint256) {
-        PairRolloverFees storage r = pairRolloverFees[pairIndex];
-
-        return r.accPerOi
-            + (ChainUtils.getBlockNumber() - r.lastUpdateBlock) * pairRolloverFees[pairIndex].rolloverFeePerBlock;
+        return currentAccRolloverFee;
     }
 
     function storeAccFundingFees(uint16 pairIndex) private {
@@ -611,25 +698,32 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         return targetFr * int64(maxFundingFeePerBlock) / int64(PRECISION_18);
     }
 
-    function getTradeRolloverFee(address trader, uint16 pairIndex, uint8 index, uint256 collateral, uint32 leverage)
-        public
-        view
-        returns (uint256)
-    {
+    function getTradeRolloverFee(
+        address trader,
+        uint16 pairIndex,
+        uint8 index,
+        bool long,
+        uint256 collateral,
+        uint32 leverage
+    ) public view returns (int256) {
         TradeInitialAccFees memory t = tradeInitialAccFees[trader][pairIndex][index];
 
-        return getTradeRolloverFeePure(t.rollover, getPendingAccRolloverFees(pairIndex), collateral, leverage);
+        int256 rollover = t.isRolloverSignNegative ? -int256(t.rollover) : int256(t.rollover);
+
+        return getTradeRolloverFeePure(rollover, getPendingAccRolloverFees(pairIndex, long), collateral, leverage);
     }
 
     function getTradeRolloverFeePure(
-        uint256 accRolloverFeesPerCollateral,
-        uint256 endAccRolloverFeesPerCollateral,
+        int256 accRolloverFeesPerCollateral,
+        int256 endAccRolloverFeesPerCollateral,
         uint256 collateral,
         uint32 leverage
-    ) public pure returns (uint256) {
-        uint256 rolloverFee = ((endAccRolloverFeesPerCollateral - accRolloverFeesPerCollateral) * collateral * leverage)
-            / PRECISION_18 / PRECISION_2;
-        return (rolloverFee > 0) ? rolloverFee : 1;
+    ) public pure returns (int256) {
+        int256 accRolloverDelta = endAccRolloverFeesPerCollateral - accRolloverFeesPerCollateral;
+        int256 rolloverFee =
+            (accRolloverDelta * (collateral * leverage).toInt256()) / int64(PRECISION_18) / int8(PRECISION_2);
+
+        return (rolloverFee != 0) ? rolloverFee : (accRolloverDelta > 0) ? int256(1) : int256(0);
     }
 
     function getTradeFundingFee(
@@ -671,22 +765,21 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         uint32 maxLeverage
     ) external view returns (uint256) {
         int256 fundingFee;
-        {
-            (int256 accPerOiLong, int256 accPerOiShort,,) = getPendingAccFundingFees(pairIndex);
-            fundingFee = getTradeFundingFeePure(
-                tradeInitialAccFees[trader][pairIndex][index].funding,
-                long ? accPerOiLong : accPerOiShort,
-                collateral,
-                leverage
-            );
-        }
+
+        (int256 accPerOiLong, int256 accPerOiShort,,) = getPendingAccFundingFees(pairIndex);
+        fundingFee = getTradeFundingFeePure(
+            tradeInitialAccFees[trader][pairIndex][index].funding,
+            long ? accPerOiLong : accPerOiShort,
+            collateral,
+            leverage
+        );
 
         return getTradeLiquidationPricePure(
             openPrice,
             long,
             collateral,
             leverage,
-            getTradeRolloverFee(trader, pairIndex, index, collateral, leverage),
+            getTradeRolloverFee(trader, pairIndex, index, long, collateral, leverage),
             fundingFee,
             maxLeverage
         );
@@ -697,13 +790,13 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         bool long,
         uint256 collateral,
         uint32 leverage,
-        uint256 rolloverFee,
+        int256 rolloverFee,
         int256 fundingFee,
         uint32 maxLeverage
     ) public view returns (uint256) {
         int256 signedCollateral = collateral.toInt256();
         int256 liqMarginValue = getTradeLiquidationMargin(collateral, leverage, maxLeverage).toInt256();
-        int256 targetCollateralAfterFees = signedCollateral - liqMarginValue - int256(rolloverFee) - fundingFee;
+        int256 targetCollateralAfterFees = signedCollateral - liqMarginValue - rolloverFee - fundingFee;
 
         int256 liqPriceDistance =
             (openPrice.toInt256() * targetCollateralAfterFees) / signedCollateral * int8(PRECISION_2) / int32(leverage);
@@ -722,37 +815,39 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
         uint32 leverage,
         int256 percentProfit,
         uint32 maxLeverage
-    ) external onlyCallbacks returns (uint256 tradeValue, uint256 liqMarginValue, uint256 r, int256 f) {
+    ) external onlyCallbacks returns (uint256 tradeValue, uint256 liqMarginValue, int256 r, int256 f) {
         storeAccFundingFees(pairIndex);
+        storeAccRolloverFees(pairIndex);
 
-        r = getTradeRolloverFee(trader, pairIndex, index, collateral, leverage);
+        TradeInitialAccFees memory t = tradeInitialAccFees[trader][pairIndex][index];
+
+        r = getTradeRolloverFeePure(
+            t.isRolloverSignNegative ? -int256(t.rollover) : int256(t.rollover),
+            long ? pairRolloverFeesV2[pairIndex].accPerOiLong : pairRolloverFeesV2[pairIndex].accPerOiShort,
+            collateral,
+            leverage
+        );
         f = getTradeFundingFeePure(
-            tradeInitialAccFees[trader][pairIndex][index].funding,
+            t.funding,
             long ? pairFundingFees[pairIndex].accPerOiLong : pairFundingFees[pairIndex].accPerOiShort,
             collateral,
             leverage
         );
 
         liqMarginValue = getTradeLiquidationMargin(collateral, leverage, maxLeverage);
-        tradeValue = getTradeValuePure(collateral, percentProfit, r, f, liqMarginValue);
-
-        if (tradeValue <= liqMarginValue) {
-            tradeValue = 0;
-        }
+        tradeValue = getTradeValuePure(collateral, percentProfit, r, f);
     }
 
-    function getTradeValuePure(
-        uint256 collateral,
-        int256 percentProfit,
-        uint256 rolloverFee,
-        int256 fundingFee,
-        uint256 liqMarginValue
-    ) public pure returns (uint256) {
+    function getTradeValuePure(uint256 collateral, int256 percentProfit, int256 rolloverFee, int256 fundingFee)
+        public
+        pure
+        returns (uint256)
+    {
         int256 signedCollateral = collateral.toInt256();
-        int256 value = signedCollateral + (signedCollateral * percentProfit) / int32(PRECISION_6) / 100
-            - int256(rolloverFee) - fundingFee;
+        int256 value =
+            signedCollateral + (signedCollateral * percentProfit) / int32(PRECISION_6) / 100 - rolloverFee - fundingFee;
 
-        if (value <= liqMarginValue.toInt256()) {
+        if (value < 0) {
             value = 0;
         }
 
@@ -766,18 +861,6 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
     {
         uint256 rawAdjustedThreshold = uint256(liqMarginThresholdP) * leverage * PRECISION_6 / maxLeverage;
         return collateral * rawAdjustedThreshold / (100 * PRECISION_6);
-    }
-
-    function getRolloverFeePerBlock(uint16 pairIndex) external view returns (uint256) {
-        return pairRolloverFees[pairIndex].rolloverFeePerBlock;
-    }
-
-    function getAccRolloverFees(uint16 pairIndex) external view returns (uint256) {
-        return pairRolloverFees[pairIndex].accPerOi;
-    }
-
-    function getAccRolloverFeesUpdateBlock(uint16 pairIndex) external view returns (uint256) {
-        return pairRolloverFees[pairIndex].lastUpdateBlock;
     }
 
     function getAccFundingFeesLong(uint16 pairIndex) external view returns (int256) {
@@ -795,9 +878,11 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
     function getTradeInitialAccRolloverFeesPerCollateral(address trader, uint16 pairIndex, uint8 index)
         external
         view
-        returns (uint256)
+        returns (int256)
     {
-        return tradeInitialAccFees[trader][pairIndex][index].rollover;
+        TradeInitialAccFees memory t = tradeInitialAccFees[trader][pairIndex][index];
+
+        return t.isRolloverSignNegative ? -int256(t.rollover) : int256(t.rollover);
     }
 
     function getTradeInitialAccFundingFeesPerOi(address trader, uint16 pairIndex, uint8 index)
@@ -818,5 +903,36 @@ contract OstiumPairInfos is IOstiumPairInfos, Initializable {
 
     function getFrSpringFactor(uint16 pairIndex) external view returns (uint64) {
         return pairFundingFees[pairIndex].springFactor;
+    }
+
+    function setPairDynamicSpreadParams(uint16 pairIndex, DynamicSpreadParams calldata params) external onlyGov {
+        if (
+            params.netVolThreshold > MAX_NET_VOL_THRESHOLD || params.decayRate < MIN_DECAY_RATE
+                || params.decayRate > MAX_DECAY_RATE
+                || (params.priceImpactK != 0 && params.priceImpactK < MIN_PRICE_IMPACT_K)
+                || params.priceImpactK > MAX_PRICE_IMPACT_K
+        ) {
+            revert WrongParams();
+        }
+
+        pairDynamicSpreadParams[pairIndex] = params;
+
+        emit PairDynamicSpreadParamsUpdated(pairIndex, params);
+    }
+
+    function updateDynamicSpreadState(uint16 pairIndex, uint256 newBuyVolume, uint256 newSellVolume)
+        external
+        onlyCallbacks
+    {
+        DynamicSpreadState storage state = pairDynamicSpreadState[pairIndex];
+        state.buyVolume = newBuyVolume;
+        state.sellVolume = newSellVolume;
+        state.lastUpdateTimestamp = block.timestamp.toUint32();
+
+        emit PairDynamicSpreadStateUpdated(pairIndex, newBuyVolume, newSellVolume);
+    }
+
+    function getPairPriceImpactK(uint16 pairIndex) external view returns (uint256) {
+        return pairDynamicSpreadParams[pairIndex].priceImpactK;
     }
 }

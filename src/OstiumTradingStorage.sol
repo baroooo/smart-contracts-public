@@ -64,6 +64,10 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
 
     mapping(uint256 => PendingRemoveCollateral) public reqID_pendingRemoveCollateral;
 
+    mapping(
+        address trader => mapping(uint16 pairIndex => mapping(uint256 tradeIndex => IOstiumTradingStorage.BuilderFee))
+    ) public builderData;
+
     constructor() {
         _disableInitializers();
     }
@@ -216,10 +220,12 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
         --totalOpenTradesCount;
     }
 
-    function storePendingMarketOrder(PendingMarketOrderV2 calldata _order, uint256 _id, bool _open)
-        external
-        onlyTrading
-    {
+    function storePendingMarketOrder(
+        PendingMarketOrderV2 calldata _order,
+        uint256 _id,
+        bool _open,
+        BuilderFee calldata bf
+    ) external onlyTrading {
         pendingOrderIds[_order.trade.trader].push(_id);
 
         reqID_pendingMarketOrder[_id] = _order;
@@ -227,6 +233,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
 
         if (_open) {
             pendingMarketOpenCount[_order.trade.trader][_order.trade.pairIndex]++;
+            builderData[_order.trade.trader][_order.trade.pairIndex][_id] = bf;
         } else {
             pendingMarketCloseCount[_order.trade.trader][_order.trade.pairIndex]++;
             openTradesInfo[_order.trade.trader][_order.trade.pairIndex][_order.trade.index].beingMarketClosed = true;
@@ -241,6 +248,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
             if (orderIds[i] == _id) {
                 if (_open) {
                     pendingMarketOpenCount[_order.trade.trader][_order.trade.pairIndex]--;
+                    delete builderData[_order.trade.trader][_order.trade.pairIndex][_id];
                 } else {
                     pendingMarketCloseCount[_order.trade.trader][_order.trade.pairIndex]--;
                     openTradesInfo[_order.trade.trader][_order.trade.pairIndex][_order.trade.index].beingMarketClosed =
@@ -262,10 +270,11 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
         o[index] = _open ? o[index] + _oiNotional : o[index] - _oiNotional;
     }
 
-    function storeOpenLimitOrder(OpenLimitOrder calldata o) external onlyTrading {
+    function storeOpenLimitOrder(OpenLimitOrder calldata o, BuilderFee calldata bf) external onlyTrading {
         pairLimitOrders[o.pairIndex].push(o);
         openLimitOrderIds[o.trader][o.pairIndex][o.index] = pairLimitOrders[o.pairIndex].length - 1;
         openLimitOrdersCount[o.trader][o.pairIndex]++;
+        builderData[o.trader][o.pairIndex][o.index] = bf;
     }
 
     function updateOpenLimitOrder(OpenLimitOrder calldata _o) external onlyTrading {
@@ -278,7 +287,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
         o.sl = _o.sl;
         o.targetPrice = _o.targetPrice;
         o.orderType = _o.orderType;
-        o.lastUpdated = ChainUtils.getBlockNumber().toUint32();
+        o.lastUpdated = uint32(block.timestamp);
     }
 
     function unregisterOpenLimitOrder(address _trader, uint16 _pairIndex, uint8 _index)
@@ -293,6 +302,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
             .index] = id;
 
         delete openLimitOrderIds[_trader][_pairIndex][_index];
+        delete builderData[_trader][_pairIndex][_index];
         pairLimitOrders[_pairIndex].pop();
 
         openLimitOrdersCount[_trader][_pairIndex]--;
@@ -337,7 +347,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
         TradeInfo storage i = openTradesInfo[_trader][_pairIndex][_index];
         if (t.leverage == 0) return;
         t.sl = _newSl.toUint192();
-        i.slLastUpdated = ChainUtils.getBlockNumber().toUint32();
+        i.slLastUpdated = block.timestamp.toUint32();
     }
 
     function updateTp(address _trader, uint16 _pairIndex, uint8 _index, uint256 _newTp) external onlyTrading {
@@ -352,7 +362,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
         TradeInfo storage i = openTradesInfo[_trader][_pairIndex][_index];
         if (t.leverage == 0) return;
         t.tp = _newTp.toUint192();
-        i.tpLastUpdated = ChainUtils.getBlockNumber().toUint32();
+        i.tpLastUpdated = block.timestamp.toUint32();
     }
 
     function updateTrade(Trade calldata _t) external onlyTradingOrCallbacks {
@@ -402,7 +412,7 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
         devFees += _amount;
     }
 
-    function refundOracleFee(uint256 _amount) external onlyTrading {
+    function refundOracleFee(uint256 _amount) external onlyTradingOrCallbacks {
         if (_amount > devFees) {
             revert RefundOracleFeeFailed();
         }
@@ -526,5 +536,13 @@ contract OstiumTradingStorage is IOstiumTradingStorage, Initializable {
 
     function unregisterPendingRemoveCollateral(uint256 orderId) external onlyCallbacks {
         delete reqID_pendingRemoveCollateral[orderId];
+    }
+
+    function getBuilderData(address _trader, uint16 _pairIndex, uint256 _index)
+        external
+        view
+        returns (BuilderFee memory)
+    {
+        return builderData[_trader][_pairIndex][_index];
     }
 }

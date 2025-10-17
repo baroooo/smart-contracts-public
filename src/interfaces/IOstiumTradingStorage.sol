@@ -33,13 +33,18 @@ interface IOstiumTradingStorage {
         bool buy;
     }
 
+    struct BuilderFee {
+        address builder;
+        uint32 builderFee; // PRECISION_6
+    }
+
     struct TradeInfo {
         uint256 tradeId;
         uint256 oiNotional; // PRECISION_18
         uint32 initialLeverage;
-        uint32 tpLastUpdated;
-        uint32 slLastUpdated;
-        uint32 createdAt;
+        uint32 tpLastUpdated; // block.timestamp
+        uint32 slLastUpdated; // block.timestamp
+        uint32 createdAt; // block.timestamp
         bool beingMarketClosed;
     }
 
@@ -50,8 +55,8 @@ interface IOstiumTradingStorage {
         uint192 sl; // PRECISION_18
         address trader;
         uint32 leverage; // PRECISION_2
-        uint32 createdAt;
-        uint32 lastUpdated;
+        uint32 createdAt; // block.timestamp
+        uint32 lastUpdated; // block.timestamp
         uint16 pairIndex;
         OpenOrderType orderType;
         uint8 index;
@@ -174,6 +179,10 @@ interface IOstiumTradingStorage {
     function getOpenLimitOrders(uint16 _pairIndex) external view returns (OpenLimitOrder[] memory);
     function totalOpenLimitOrders(uint16 pairIndex) external view returns (uint256);
     function getPairOpeningInterestInfo(uint16 _pairIndex) external view returns (uint256, uint256, uint256);
+    function getBuilderData(address _trader, uint16 _pairIndex, uint256 _index)
+        external
+        view
+        returns (BuilderFee memory);
 
     // onlyGov
     function claimFees(uint256 _amount) external;
@@ -185,8 +194,13 @@ interface IOstiumTradingStorage {
     // onlyTrading
     function storeTrade(Trade memory _trade, TradeInfo memory _tradeInfo) external;
     function unregisterTrade(address _trader, uint16 _pairIndex, uint8 _index, uint256 _collateralToClose) external;
-    function storePendingMarketOrder(PendingMarketOrderV2 calldata _order, uint256 _id, bool _open) external;
-    function storeOpenLimitOrder(OpenLimitOrder calldata) external;
+    function storePendingMarketOrder(
+        PendingMarketOrderV2 calldata _order,
+        uint256 _id,
+        bool _open,
+        BuilderFee calldata bf
+    ) external;
+    function storeOpenLimitOrder(OpenLimitOrder calldata, BuilderFee calldata bf) external;
     function updateOpenLimitOrder(OpenLimitOrder calldata) external;
     function setTrigger(address _trader, uint16 _pairIndex, uint8 _index, IOstiumTradingStorage.LimitOrder _orderType)
         external;

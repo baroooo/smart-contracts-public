@@ -363,6 +363,10 @@ contract OstiumPairsStorage is IOstiumPairsStorage, Initializable {
     }
 
     function getPairsMaxLeverage(uint256 startId, uint256 finalId) external view returns (uint32[] memory) {
+        if (startId >= pairsCount || finalId >= pairsCount || startId > finalId) {
+            revert WrongParams();
+        }
+
         uint32[] memory lev = new uint32[](pairsCount);
 
         for (uint16 i = startId.toUint16(); i <= finalId.toUint16(); i++) {
