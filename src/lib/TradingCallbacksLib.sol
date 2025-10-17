@@ -14,12 +14,29 @@ library TradingCallbacksLib {
     using SafeCast for uint256;
     using SafeCast for uint192;
 
+    uint256 constant PRECISION_27 = 1e27;
     uint64 constant PRECISION_18 = 1e18;
+    uint64 constant PRECISION_10 = 1e10;
     uint32 constant PRECISION_6 = 1e6;
     uint16 constant MAX_GAIN_P = 900; // 900% PnL (10x)
+    uint256 constant SPREAD_DIVISOR = 2 * PRECISION_18;
 
-    function getTradePriceImpact(int192 price, int192 ask, int192 bid, bool isOpen, bool isLong)
-        public
+    struct PriceImpactResult {
+        uint256 priceImpactP;
+        uint256 priceAfterImpact;
+        bool isDynamic;
+    }
+
+    struct TradeValueResult {
+        uint256 tradeValue;
+        uint256 liqMarginValue;
+        int256 rolloverFees;
+        int256 fundingFees;
+        int256 profitP;
+    }
+
+    function _getTradePriceImpact(int192 price, int192 ask, int192 bid, bool isOpen, bool isLong)
+        internal
         pure
         returns (uint256 priceImpactP, uint256 priceAfterImpact)
     {
@@ -30,7 +47,7 @@ library TradingCallbacksLib {
 
         int192 usedPrice = aboveSpot ? ask : bid;
 
-        priceImpactP += (SignedMath.abs(price - usedPrice) * PRECISION_18 / uint192(price) * 100);
+        priceImpactP = (SignedMath.abs(price - usedPrice) * PRECISION_18 / uint192(price) * 100);
 
         return (priceImpactP, uint192(usedPrice));
     }
@@ -56,7 +73,7 @@ library TradingCallbacksLib {
         bool buy,
         int32 leverage,
         int32 initialLeverage
-    ) external pure returns (int256 p, int256 maxPnlP) {
+    ) public pure returns (int256 p, int256 maxPnlP) {
         return _currentPercentProfit(openPrice, currentPrice, buy, leverage, initialLeverage);
     }
 
@@ -127,6 +144,41 @@ library TradingCallbacksLib {
             && pairsStorage.groupCollateral(pairIndex, buy) + collateral <= pairsStorage.groupMaxCollateral(pairIndex);
     }
 
+    function getTradeAndPriceData(
+        IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a,
+        IOstiumTradingStorage.Trade calldata t,
+        IOstiumPairInfos pairInfos,
+        uint32 initialLeverage,
+        uint32 maxLeverage,
+        uint256 collateral,
+        bool isMarketPrice
+    ) external returns (TradeValueResult memory, PriceImpactResult memory) {
+        PriceImpactResult memory result =
+            getDynamicTradePriceImpact(a.price, a.ask, a.bid, false, t, pairInfos, collateral);
+
+        (int256 profitP,) = currentPercentProfit(
+            t.openPrice.toInt256(),
+            isMarketPrice ? a.price : result.priceAfterImpact.toInt256(),
+            t.buy,
+            int32(t.leverage),
+            int32(initialLeverage)
+        );
+
+        (uint256 tradeValue, uint256 liqMarginValue, int256 rolloverFees, int256 fundingFees) =
+            pairInfos.getTradeValue(t.trader, t.pairIndex, t.index, t.buy, collateral, t.leverage, profitP, maxLeverage);
+
+        return (
+            TradeValueResult({
+                tradeValue: tradeValue,
+                liqMarginValue: liqMarginValue,
+                rolloverFees: rolloverFees,
+                fundingFees: fundingFees,
+                profitP: profitP
+            }),
+            result
+        );
+    }
+
     function getOpenTradeMarketCancelReason(
         bool isPaused,
         uint256 wantedPrice,
@@ -141,7 +193,6 @@ library TradingCallbacksLib {
         uint256 maxSlippage = (wantedPrice * slippageP) / 100 / 100;
 
         if (isPaused) return IOstiumTradingCallbacks.CancelReason.PAUSED;
-        if (a_price == 0) return IOstiumTradingCallbacks.CancelReason.MARKET_CLOSED;
 
         // Check slippage
         if (trade.buy ? trade.openPrice > wantedPrice + maxSlippage : trade.openPrice < wantedPrice - maxSlippage) {
@@ -149,12 +200,12 @@ library TradingCallbacksLib {
         }
 
         // Check if TP is reached
-        if (trade.tp > 0 && (trade.buy ? trade.openPrice >= trade.tp : trade.openPrice <= trade.tp)) {
+        if (trade.tp != 0 && (trade.buy ? trade.openPrice >= trade.tp : trade.openPrice <= trade.tp)) {
             return IOstiumTradingCallbacks.CancelReason.TP_REACHED;
         }
 
         // Check if SL is reached
-        if (trade.sl > 0 && (trade.buy ? trade.openPrice <= trade.sl : trade.openPrice >= trade.sl)) {
+        if (trade.sl != 0 && (trade.buy ? trade.openPrice <= trade.sl : trade.openPrice >= trade.sl)) {
             return IOstiumTradingCallbacks.CancelReason.SL_REACHED;
         }
 
@@ -188,13 +239,23 @@ library TradingCallbacksLib {
         IOstiumPairInfos pairInfos,
         IOstiumPairsStorage pairsStorage,
         IOstiumTradingStorage tradingStorage
-    ) public view returns (IOstiumTradingCallbacks.CancelReason) {
+    ) external view returns (IOstiumTradingCallbacks.CancelReason) {
         // Check if price target is hit based on order type
         bool isNotHit = o.orderType == IOstiumTradingStorage.OpenOrderType.LIMIT
             ? (o.buy ? priceAfterImpact > o.targetPrice : priceAfterImpact < o.targetPrice)
             : (o.buy ? uint192(a_price) < o.targetPrice : uint192(a_price) > o.targetPrice);
 
         if (isNotHit) return IOstiumTradingCallbacks.CancelReason.NOT_HIT;
+
+        // Check if TP is reached
+        if (o.tp != 0 && (o.buy ? priceAfterImpact >= o.tp : priceAfterImpact <= o.tp)) {
+            return IOstiumTradingCallbacks.CancelReason.TP_REACHED;
+        }
+
+        // Check if SL is reached
+        if (o.sl != 0 && (o.buy ? priceAfterImpact <= o.sl : priceAfterImpact >= o.sl)) {
+            return IOstiumTradingCallbacks.CancelReason.SL_REACHED;
+        }
 
         // Check exposure limits
         if (
@@ -221,7 +282,7 @@ library TradingCallbacksLib {
     function getAutomationCloseOrderCancelReason(
         IOstiumTradingStorage.LimitOrder orderType,
         IOstiumTradingStorage.Trade memory t,
-        uint256 priceAfterImpact,
+        uint256 triggerPrice,
         uint256 usdcSentToTrader,
         bool isDayTradeClosed
     ) external pure returns (IOstiumTradingCallbacks.CancelReason) {
@@ -234,11 +295,11 @@ library TradingCallbacksLib {
                 ? IOstiumTradingCallbacks.CancelReason.NONE
                 : IOstiumTradingCallbacks.CancelReason.NOT_HIT;
         } else if (orderType == IOstiumTradingStorage.LimitOrder.TP) {
-            return t.tp > 0 && (t.buy ? priceAfterImpact >= t.tp : priceAfterImpact <= t.tp)
+            return t.tp > 0 && (t.buy ? triggerPrice >= t.tp : triggerPrice <= t.tp)
                 ? IOstiumTradingCallbacks.CancelReason.NONE
                 : IOstiumTradingCallbacks.CancelReason.NOT_HIT;
         } else if (orderType == IOstiumTradingStorage.LimitOrder.SL) {
-            return t.sl > 0 && (t.buy ? priceAfterImpact <= t.sl : priceAfterImpact >= t.sl)
+            return t.sl > 0 && (t.buy ? triggerPrice <= t.sl : triggerPrice >= t.sl)
                 ? IOstiumTradingCallbacks.CancelReason.NONE
                 : IOstiumTradingCallbacks.CancelReason.NOT_HIT;
         }
@@ -246,11 +307,38 @@ library TradingCallbacksLib {
     }
 
     function getHandleRemoveCollateralCancelReason(
+        IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a,
         IOstiumTradingStorage.Trade memory trade,
-        uint32 maxLeverage,
-        uint256 usdcSentToTrader,
-        bool isMaxPnlP
-    ) external pure returns (IOstiumTradingCallbacks.CancelReason) {
+        IOstiumPairInfos pairInfos,
+        IOstiumPairsStorage pairsStorage,
+        uint32 initialLeverage
+    ) external returns (IOstiumTradingCallbacks.CancelReason) {
+        TradingCallbacksLib.PriceImpactResult memory result =
+            getDynamicTradePriceImpact(a.price, a.ask, a.bid, false, trade, pairInfos, trade.collateral);
+
+        (int256 profitP, int256 maxPnlP) = currentPercentProfit(
+            trade.openPrice.toInt256(),
+            result.priceAfterImpact.toInt256(),
+            trade.buy,
+            int32(trade.leverage),
+            int32(initialLeverage)
+        );
+
+        uint32 maxLeverage = pairsStorage.pairMaxLeverage(trade.pairIndex);
+        (uint256 tradeValue, uint256 liqMarginValue,,) = pairInfos.getTradeValue(
+            trade.trader,
+            trade.pairIndex,
+            trade.index,
+            trade.buy,
+            trade.collateral,
+            trade.leverage,
+            profitP,
+            maxLeverage
+        );
+
+        bool isLiquidated = tradeValue < liqMarginValue;
+        uint256 usdcSentToTrader = isLiquidated ? 0 : tradeValue;
+
         if (usdcSentToTrader == 0) {
             return IOstiumTradingCallbacks.CancelReason.UNDER_LIQUIDATION;
         }
@@ -259,10 +347,155 @@ library TradingCallbacksLib {
             return IOstiumTradingCallbacks.CancelReason.MAX_LEVERAGE;
         }
 
-        if (isMaxPnlP) {
+        if (profitP == maxPnlP) {
             return IOstiumTradingCallbacks.CancelReason.GAIN_LOSS;
         }
 
         return IOstiumTradingCallbacks.CancelReason.NONE;
+    }
+
+    function _decayVolumeWithPade(uint256 volume, uint32 decayInterval, uint128 decayRate)
+        internal
+        pure
+        returns (uint256 decayedVolume)
+    {
+        if (decayInterval == 0) {
+            return volume;
+        }
+
+        uint256 decayFactor_half = uint256(decayRate) * decayInterval / 2;
+        uint256 numerator = PRECISION_18 > decayFactor_half ? PRECISION_18 - decayFactor_half : 0;
+        uint256 denominator = PRECISION_18 + decayFactor_half;
+        uint256 decayMultiplier = numerator * PRECISION_18 / denominator;
+
+        return uint128(uint256(volume) * decayMultiplier / PRECISION_18);
+    }
+
+    function _priceImpactFunction(
+        uint256 netVolThreshold,
+        uint256 priceImpactK,
+        bool buy,
+        bool isOpen,
+        uint256 tradeSize,
+        int256 initialImbalance,
+        uint256 midPrice,
+        uint256 askPrice,
+        uint256 bidPrice
+    ) internal pure returns (uint256 priceImpactP) {
+        int256 nextImbalance = initialImbalance + (isOpen == buy ? int256(tradeSize) : -int256(tradeSize));
+        uint256 absNextImbalance = nextImbalance >= 0 ? uint256(nextImbalance) : uint256(-nextImbalance);
+        uint256 absInitialImbalance = initialImbalance >= 0 ? uint256(initialImbalance) : uint256(-initialImbalance);
+
+        if (absNextImbalance < absInitialImbalance && (initialImbalance * nextImbalance >= 0)) {
+            return 0;
+        }
+
+        if (absNextImbalance <= netVolThreshold) {
+            return 0;
+        }
+
+        uint256 spread = (askPrice - bidPrice) * PRECISION_18 / midPrice;
+        uint256 excessOverThreshold = absNextImbalance - netVolThreshold;
+        uint256 thresholdTradeSize = tradeSize < excessOverThreshold ? tradeSize : excessOverThreshold;
+        uint256 spreadComponent = (spread * thresholdTradeSize) / SPREAD_DIVISOR;
+
+        uint256 dynamicComponent = 0;
+        if (excessOverThreshold > 0 && thresholdTradeSize > 0) {
+            uint256 thresholdRatio = (thresholdTradeSize * PRECISION_18) / excessOverThreshold;
+            uint256 excessSquared = (excessOverThreshold * excessOverThreshold) / PRECISION_18;
+            dynamicComponent = (
+                (thresholdTradeSize * thresholdRatio / PRECISION_18) * (priceImpactK * excessSquared / PRECISION_27)
+            ) / PRECISION_18;
+        }
+
+        uint256 priceImpactUSD = spreadComponent + dynamicComponent;
+        priceImpactP = priceImpactUSD * PRECISION_18 / tradeSize * 100;
+
+        return priceImpactP;
+    }
+
+    function getDynamicTradePriceImpact(
+        int192 price,
+        int192 ask,
+        int192 bid,
+        bool isOpen,
+        IOstiumTradingStorage.Trade memory trade,
+        IOstiumPairInfos pairInfos,
+        uint256 collateralValue
+    ) public returns (PriceImpactResult memory) {
+        uint256 priceImpactK = pairInfos.getPairPriceImpactK(trade.pairIndex);
+
+        uint256 priceImpactP;
+        uint256 priceAfterImpact;
+        if (priceImpactK == 0) {
+            (priceImpactP, priceAfterImpact) = _getTradePriceImpact(price, ask, bid, isOpen, trade.buy);
+            return PriceImpactResult({priceImpactP: priceImpactP, priceAfterImpact: priceAfterImpact, isDynamic: false});
+        }
+
+        (uint256 netVolThreshold, uint128 decayRate,) = pairInfos.pairDynamicSpreadParams(trade.pairIndex);
+
+        (uint256 buyVolume, uint256 sellVolume, uint32 lastUpdateTimestamp) =
+            pairInfos.pairDynamicSpreadState(trade.pairIndex);
+
+        uint32 dt = block.timestamp > lastUpdateTimestamp ? uint32(block.timestamp) - lastUpdateTimestamp : 0;
+
+        uint256 decayedBuyVolume = _decayVolumeWithPade(buyVolume, dt, decayRate);
+        uint256 decayedSellVolume = _decayVolumeWithPade(sellVolume, dt, decayRate);
+
+        uint256 tradeNotional = collateralValue * trade.leverage * PRECISION_10;
+
+        int256 initialImbalance = int256(decayedBuyVolume) - int256(decayedSellVolume);
+
+        priceAfterImpact = uint192(price);
+
+        priceImpactP = _priceImpactFunction(
+            netVolThreshold,
+            priceImpactK,
+            trade.buy,
+            isOpen,
+            tradeNotional,
+            initialImbalance,
+            uint192(price),
+            uint192(ask),
+            uint192(bid)
+        );
+
+        if (priceImpactP > 0) {
+            if (isOpen == trade.buy) {
+                priceAfterImpact = priceAfterImpact * (PRECISION_18 + (priceImpactP / 100)) / PRECISION_18;
+            } else {
+                priceAfterImpact =
+                    priceImpactP < 100e18 ? priceAfterImpact * (PRECISION_18 - (priceImpactP / 100)) / PRECISION_18 : 0;
+            }
+        }
+
+        return PriceImpactResult({priceImpactP: priceImpactP, priceAfterImpact: priceAfterImpact, isDynamic: true});
+    }
+
+    function calculateDecayedVolumesWithPostFeeCollateral(
+        uint16 pairIndex,
+        bool isOpen,
+        bool isBuy,
+        uint256 postFeeCollateral,
+        uint32 leverage,
+        IOstiumPairInfos pairInfos
+    ) external returns (uint256 decayedBuyVolume, uint256 decayedSellVolume) {
+        (, uint128 decayRate,) = pairInfos.pairDynamicSpreadParams(pairIndex);
+
+        (uint256 buyVolume, uint256 sellVolume, uint32 lastUpdateTimestamp) =
+            pairInfos.pairDynamicSpreadState(pairIndex);
+
+        uint32 dt = block.timestamp > lastUpdateTimestamp ? uint32(block.timestamp) - lastUpdateTimestamp : 0;
+
+        decayedBuyVolume = _decayVolumeWithPade(buyVolume, dt, decayRate);
+        decayedSellVolume = _decayVolumeWithPade(sellVolume, dt, decayRate);
+
+        uint256 tradeNotional = postFeeCollateral * leverage * PRECISION_10;
+
+        if (isOpen == isBuy) {
+            decayedBuyVolume += tradeNotional;
+        } else {
+            decayedSellVolume += tradeNotional;
+        }
     }
 }

@@ -12,7 +12,6 @@ import './interfaces/IOstiumTradingCallbacks.sol';
 import './interfaces/IOstiumPairsStorage.sol';
 
 import './interfaces/IOstiumOpenPnl.sol';
-import './lib/ChainUtils.sol';
 import './lib/TradingCallbacksLib.sol';
 
 pragma solidity ^0.8.24;
@@ -115,6 +114,29 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
         }
     }
 
+    function getContracts()
+        private
+        view
+        returns (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos, IOstiumPairsStorage pairsStorage)
+    {
+        storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
+        pairInfos = IOstiumPairInfos(registry.getContractAddress('pairInfos'));
+        pairsStorage = IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
+    }
+
+    function _updateDynamicSpreadVolumes(
+        uint16 pairIndex,
+        bool isOpen,
+        bool isBuy,
+        uint256 collateral,
+        uint32 leverage,
+        IOstiumPairInfos pairInfos
+    ) private {
+        (uint256 decayedBuyVolume, uint256 decayedSellVolume) = TradingCallbacksLib
+            .calculateDecayedVolumesWithPostFeeCollateral(pairIndex, isOpen, isBuy, collateral, leverage, pairInfos);
+        pairInfos.updateDynamicSpreadState(pairIndex, decayedBuyVolume, decayedSellVolume);
+    }
+
     function setMaxSl_P(uint256 _maxSl_P) external onlyGov {
         if (_maxSl_P == 0 || _maxSl_P > 100) {
             revert WrongParams();
@@ -150,10 +172,10 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
     }
 
     function openTradeMarketCallback(IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a) external notDone {
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        IOstiumPairsStorage pairsStorage = IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
+        (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos, IOstiumPairsStorage pairsStorage) = getContracts();
         (uint256 _block, uint256 wantedPrice, uint256 slippageP, IOstiumTradingStorage.Trade memory trade,) =
             storageT.reqID_pendingMarketOrder(a.orderId);
+        IOstiumTradingStorage.BuilderFee memory bf = storageT.getBuilderData(trade.trader, trade.pairIndex, a.orderId);
 
         isPriceUpKeep(trade.pairIndex);
 
@@ -161,21 +183,27 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
             return;
         }
 
-        (uint256 priceImpactP, uint256 priceAfterImpact) =
-            TradingCallbacksLib.getTradePriceImpact(a.price, a.ask, a.bid, true, trade.buy);
-        trade.openPrice = priceAfterImpact.toUint192();
+        TradingCallbacksLib.PriceImpactResult memory result;
         CancelReason cancelReason;
 
-        if (isDayTradeClosed(trade.pairIndex, trade.leverage, a.isDayTradingClosed)) {
+        if (a.price <= 0 || a.bid <= 0 || a.ask <= 0) {
+            cancelReason = CancelReason.MARKET_CLOSED;
+        } else if (isDayTradeClosed(trade.pairIndex, trade.leverage, a.isDayTradingClosed)) {
             cancelReason = CancelReason.DAY_TRADE_NOT_ALLOWED;
         } else {
+            result = TradingCallbacksLib.getDynamicTradePriceImpact(
+                a.price, int192(a.ask), int192(a.bid), true, trade, pairInfos, trade.collateral
+            );
+
+            trade.openPrice = result.priceAfterImpact.toUint192();
+
             cancelReason = TradingCallbacksLib.getOpenTradeMarketCancelReason(
                 isPaused,
                 wantedPrice,
                 slippageP,
                 uint192(a.price),
                 trade,
-                priceImpactP,
+                result.priceImpactP,
                 IOstiumPairInfos(registry.getContractAddress('pairInfos')),
                 pairsStorage,
                 storageT
@@ -183,12 +211,18 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
         }
 
         if (cancelReason == CancelReason.NONE) {
-            trade = registerTrade(a.orderId, trade, uint192(a.price));
+            trade = registerTrade(a.orderId, trade, uint192(a.price), bf);
+
+            if (result.isDynamic) {
+                _updateDynamicSpreadVolumes(
+                    trade.pairIndex, true, trade.buy, trade.collateral, trade.leverage, pairInfos
+                );
+            }
             uint256 tradeNotional = storageT.getOpenTradeInfo(trade.trader, trade.pairIndex, trade.index).oiNotional;
             IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
                 a.price, trade.openPrice, 0, tradeNotional, trade.pairIndex, trade.buy, true
             );
-            emit MarketOpenExecuted(a.orderId, trade, priceImpactP, tradeNotional);
+            emit MarketOpenExecuted(a.orderId, trade, result.priceImpactP, tradeNotional);
         } else {
             uint256 oracleFee = pairsStorage.pairOracleFee(trade.pairIndex);
             if (trade.collateral > oracleFee) {
@@ -205,9 +239,14 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
     }
 
     function closeTradeMarketCallback(IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a) external notDone {
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        (uint256 _block,,, IOstiumTradingStorage.Trade memory trade, uint16 closePercentage) =
-            storageT.reqID_pendingMarketOrder(a.orderId);
+        (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos,) = getContracts();
+        (
+            uint256 _block,
+            uint256 wantedPrice,
+            uint256 slippageP,
+            IOstiumTradingStorage.Trade memory trade,
+            uint16 closePercentage
+        ) = storageT.reqID_pendingMarketOrder(a.orderId);
 
         isPriceUpKeep(trade.pairIndex);
 
@@ -217,8 +256,9 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
 
         IOstiumTradingStorage.Trade memory t = storageT.getOpenTrade(trade.trader, trade.pairIndex, trade.index);
 
-        CancelReason cancelReason =
-            t.leverage == 0 ? CancelReason.NO_TRADE : (a.price == 0 ? CancelReason.MARKET_CLOSED : CancelReason.NONE);
+        CancelReason cancelReason = t.leverage == 0
+            ? CancelReason.NO_TRADE
+            : ((a.price <= 0 || a.bid <= 0 || a.ask <= 0) ? CancelReason.MARKET_CLOSED : CancelReason.NONE);
 
         IOstiumTradingStorage.TradeInfo memory i = storageT.getOpenTradeInfo(t.trader, t.pairIndex, t.index);
 
@@ -226,52 +266,87 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
             if (cancelReason == CancelReason.NONE) {
                 uint256 collateralToClose = t.collateral * closePercentage / 100e2;
 
-                (uint256 priceImpactP, uint256 priceAfterImpact) =
-                    TradingCallbacksLib.getTradePriceImpact(a.price, a.ask, a.bid, false, trade.buy);
-
-                (int256 profitP,) = TradingCallbacksLib.currentPercentProfit(
-                    t.openPrice.toInt256(),
-                    priceAfterImpact.toInt256(),
-                    t.buy,
-                    int32(t.leverage),
-                    int32(i.initialLeverage)
-                );
-
-                (uint256 usdcSentToTrader, uint256 liqMarginValue, uint256 rolloverFees, int256 fundingFees) =
-                IOstiumPairInfos(registry.getContractAddress('pairInfos')).getTradeValue(
-                    t.trader,
-                    t.pairIndex,
-                    t.index,
-                    t.buy,
-                    collateralToClose,
-                    t.leverage,
-                    profitP,
-                    IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairMaxLeverage(t.pairIndex)
-                );
-
-                unregisterTrade(
-                    a.orderId,
-                    i.tradeId,
+                (
+                    TradingCallbacksLib.TradeValueResult memory tvResult,
+                    TradingCallbacksLib.PriceImpactResult memory piResult
+                ) = TradingCallbacksLib.getTradeAndPriceData(
+                    a,
                     t,
-                    usdcSentToTrader,
-                    usdcSentToTrader == 0 ? liqMarginValue : 0,
-                    collateralToClose
+                    pairInfos,
+                    i.initialLeverage,
+                    IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairMaxLeverage(t.pairIndex),
+                    collateralToClose,
+                    true
                 );
 
-                IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
-                    a.price,
-                    t.openPrice,
-                    priceAfterImpact,
-                    i.oiNotional * closePercentage / 100e2,
-                    t.pairIndex,
-                    t.buy,
-                    false
-                );
+                uint256 maxSlippage = (wantedPrice * slippageP) / 100 / 100;
 
-                emit FeesCharged(a.orderId, i.tradeId, t.trader, rolloverFees, fundingFees);
-                emit MarketCloseExecutedV2(
-                    a.orderId, i.tradeId, priceAfterImpact, priceImpactP, profitP, usdcSentToTrader, closePercentage
-                );
+                if (
+                    t.buy
+                        ? piResult.priceAfterImpact < wantedPrice - maxSlippage
+                        : piResult.priceAfterImpact > wantedPrice + maxSlippage
+                ) {
+                    cancelReason = IOstiumTradingCallbacks.CancelReason.SLIPPAGE;
+                } else {
+                    if (piResult.isDynamic) {
+                        _updateDynamicSpreadVolumes(t.pairIndex, false, t.buy, collateralToClose, t.leverage, pairInfos);
+                    }
+
+                    bool isLiquidated = tvResult.tradeValue < tvResult.liqMarginValue;
+
+                    (tvResult.profitP,) = TradingCallbacksLib.currentPercentProfit(
+                        t.openPrice.toInt256(),
+                        piResult.priceAfterImpact.toInt256(),
+                        t.buy,
+                        int32(t.leverage),
+                        int32(i.initialLeverage)
+                    );
+                    tvResult.tradeValue = pairInfos.getTradeValuePure(
+                        collateralToClose, tvResult.profitP, tvResult.rolloverFees, tvResult.fundingFees
+                    );
+
+                    uint256 liquidationFee = isLiquidated ? tvResult.tradeValue : 0;
+
+                    unregisterTrade(
+                        a.orderId,
+                        i.tradeId,
+                        t,
+                        isLiquidated ? 0 : tvResult.tradeValue,
+                        liquidationFee,
+                        collateralToClose
+                    );
+
+                    IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
+                        a.price,
+                        t.openPrice,
+                        piResult.priceAfterImpact,
+                        i.oiNotional * closePercentage / 100e2,
+                        t.pairIndex,
+                        t.buy,
+                        false
+                    );
+
+                    emit FeesChargedV2(a.orderId, i.tradeId, t.trader, tvResult.rolloverFees, tvResult.fundingFees);
+                    emit MarketCloseExecutedV2(
+                        a.orderId,
+                        i.tradeId,
+                        piResult.priceAfterImpact,
+                        piResult.priceImpactP,
+                        tvResult.profitP,
+                        tvResult.tradeValue,
+                        closePercentage
+                    );
+
+                    if (closePercentage == 100e2) {
+                        // Full close and successfully closed - refund the oracle fee
+                        IOstiumPairsStorage pairsStorage =
+                            IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
+                        uint256 oracleFee = pairsStorage.pairOracleFee(t.pairIndex);
+                        storageT.refundOracleFee(oracleFee);
+                        storageT.transferUsdc(address(storageT), t.trader, oracleFee);
+                        emit OracleFeeRefunded(i.tradeId, t.trader, t.pairIndex, oracleFee);
+                    }
+                }
             }
         }
 
@@ -283,35 +358,42 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
     }
 
     function executeAutomationOpenOrderCallback(IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a) external notDone {
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        IOstiumPairInfos pairInfos = IOstiumPairInfos(registry.getContractAddress('pairInfos'));
+        (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos,) = getContracts();
 
         CancelReason cancelReason;
         (address trader, uint16 pairIndex, uint8 index,) = storageT.reqID_pendingAutomationOrder(a.orderId);
         isPriceUpKeep(pairIndex);
 
-        IOstiumTradingStorage.OpenLimitOrder memory o = storageT.getOpenLimitOrder(trader, pairIndex, index);
-
         cancelReason = isPaused
             ? CancelReason.PAUSED
             : (
-                a.price == 0
+                (a.price <= 0 || a.bid <= 0 || a.ask <= 0)
                     ? CancelReason.MARKET_CLOSED
-                    : !storageT.hasOpenLimitOrder(trader, pairIndex, index)
-                        ? CancelReason.NO_TRADE
-                        : isDayTradeClosed(pairIndex, o.leverage, a.isDayTradingClosed)
-                            ? CancelReason.DAY_TRADE_NOT_ALLOWED
-                            : CancelReason.NONE
+                    : !storageT.hasOpenLimitOrder(trader, pairIndex, index) ? CancelReason.NO_TRADE : CancelReason.NONE
             );
 
+        IOstiumTradingStorage.OpenLimitOrder memory o;
+        IOstiumTradingStorage.BuilderFee memory bf;
         if (cancelReason == CancelReason.NONE) {
-            (uint256 priceImpactP, uint256 priceAfterImpact) =
-                TradingCallbacksLib.getTradePriceImpact(a.price, a.ask, a.bid, true, o.buy);
+            o = storageT.getOpenLimitOrder(trader, pairIndex, index);
+            bf = storageT.getBuilderData(trader, pairIndex, index);
+            if (isDayTradeClosed(pairIndex, o.leverage, a.isDayTradingClosed)) {
+                cancelReason = CancelReason.DAY_TRADE_NOT_ALLOWED;
+            }
+        }
+
+        if (cancelReason == CancelReason.NONE) {
+            IOstiumTradingStorage.Trade memory tempTrade =
+                IOstiumTradingStorage.Trade(o.collateral, 0, o.tp, o.sl, o.trader, o.leverage, o.pairIndex, 0, o.buy);
+            TradingCallbacksLib.PriceImpactResult memory result = TradingCallbacksLib.getDynamicTradePriceImpact(
+                a.price, a.ask, a.bid, true, tempTrade, pairInfos, o.collateral
+            );
+
             cancelReason = TradingCallbacksLib.getAutomationOpenOrderCancelReason(
                 o,
-                priceAfterImpact,
+                result.priceAfterImpact,
                 uint192(a.price),
-                priceImpactP,
+                result.priceImpactP,
                 pairInfos,
                 IOstiumPairsStorage(registry.getContractAddress('pairsStorage')),
                 storageT
@@ -322,7 +404,7 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
                     a.orderId,
                     IOstiumTradingStorage.Trade(
                         o.collateral,
-                        priceAfterImpact.toUint192(),
+                        result.priceAfterImpact.toUint192(),
                         o.tp,
                         o.sl,
                         o.trader,
@@ -331,8 +413,15 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
                         0,
                         o.buy
                     ),
-                    uint192(a.price)
+                    uint192(a.price),
+                    bf
                 );
+
+                if (result.isDynamic) {
+                    _updateDynamicSpreadVolumes(
+                        trade.pairIndex, true, trade.buy, trade.collateral, trade.leverage, pairInfos
+                    );
+                }
                 uint256 tradeNotional = storageT.getOpenTradeInfo(trade.trader, trade.pairIndex, trade.index).oiNotional;
 
                 IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
@@ -340,7 +429,7 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
                 );
                 storageT.unregisterOpenLimitOrder(o.trader, o.pairIndex, o.index);
 
-                emit LimitOpenExecuted(a.orderId, o.index, trade, priceImpactP, tradeNotional);
+                emit LimitOpenExecuted(a.orderId, o.index, trade, result.priceImpactP, tradeNotional);
             }
         }
 
@@ -352,95 +441,93 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
     }
 
     function executeAutomationCloseOrderCallback(IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a) external notDone {
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        IOstiumPairInfos pairInfos = IOstiumPairInfos(registry.getContractAddress('pairInfos'));
+        (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos,) = getContracts();
 
         IOstiumTradingStorage.LimitOrder orderType;
         IOstiumTradingStorage.Trade memory t;
-        {
-            (address trader, uint16 pairIndex, uint8 index, IOstiumTradingStorage.LimitOrder _orderType) =
-                storageT.reqID_pendingAutomationOrder(a.orderId);
-            isPriceUpKeep(pairIndex);
-            t = storageT.getOpenTrade(trader, pairIndex, index);
-            orderType = _orderType;
-        }
 
-        CancelReason cancelReason =
-            a.price == 0 ? CancelReason.MARKET_CLOSED : (t.leverage == 0 ? CancelReason.NO_TRADE : CancelReason.NONE);
+        (address trader, uint16 pairIndex, uint8 index, IOstiumTradingStorage.LimitOrder _orderType) =
+            storageT.reqID_pendingAutomationOrder(a.orderId);
+        isPriceUpKeep(pairIndex);
+        t = storageT.getOpenTrade(trader, pairIndex, index);
+        orderType = _orderType;
+
+        CancelReason cancelReason = (a.price <= 0 || a.bid <= 0 || a.ask <= 0)
+            ? CancelReason.MARKET_CLOSED
+            : (t.leverage == 0 ? CancelReason.NO_TRADE : CancelReason.NONE);
 
         IOstiumTradingStorage.TradeInfo memory i = storageT.getOpenTradeInfo(t.trader, t.pairIndex, t.index);
 
         if (cancelReason == CancelReason.NONE) {
             bool isMarketPrice =
                 orderType == IOstiumTradingStorage.LimitOrder.LIQ || orderType == IOstiumTradingStorage.LimitOrder.SL;
-            (uint256 priceImpactP, uint256 priceAfterImpact) =
-                TradingCallbacksLib.getTradePriceImpact(a.price, a.ask, a.bid, false, t.buy);
 
-            (int256 profitP,) = TradingCallbacksLib.currentPercentProfit(
-                t.openPrice.toInt256(),
-                isMarketPrice ? a.price : priceAfterImpact.toInt256(),
-                t.buy,
-                int32(t.leverage),
-                int32(i.initialLeverage)
-            );
-            (uint256 usdcSentToTrader, uint256 liqMarginValue, uint256 rolloverFees, int256 fundingFees) = pairInfos
-                .getTradeValue(
-                t.trader,
-                t.pairIndex,
-                t.index,
-                t.buy,
+            (
+                TradingCallbacksLib.TradeValueResult memory tvResult,
+                TradingCallbacksLib.PriceImpactResult memory piResult
+            ) = TradingCallbacksLib.getTradeAndPriceData(
+                a,
+                t,
+                pairInfos,
+                i.initialLeverage,
+                IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairMaxLeverage(t.pairIndex),
                 t.collateral,
-                t.leverage,
-                profitP,
-                IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairMaxLeverage(t.pairIndex)
+                isMarketPrice
             );
+
+            bool isLiquidated = tvResult.tradeValue < tvResult.liqMarginValue;
 
             cancelReason = TradingCallbacksLib.getAutomationCloseOrderCancelReason(
                 orderType,
                 t,
-                priceAfterImpact,
-                usdcSentToTrader,
+                isMarketPrice ? uint192(a.price) : piResult.priceAfterImpact,
+                isLiquidated ? 0 : tvResult.tradeValue,
                 isDayTradeClosed(t.pairIndex, t.leverage, a.isDayTradingClosed)
             );
 
             if (cancelReason == CancelReason.NONE) {
                 if (isMarketPrice) {
-                    (profitP,) = TradingCallbacksLib.currentPercentProfit(
+                    (tvResult.profitP,) = TradingCallbacksLib.currentPercentProfit(
                         t.openPrice.toInt256(),
-                        priceAfterImpact.toInt256(),
+                        piResult.priceAfterImpact.toInt256(),
                         t.buy,
                         int32(t.leverage),
                         int32(i.initialLeverage)
                     );
-                    usdcSentToTrader =
-                        pairInfos.getTradeValuePure(t.collateral, profitP, rolloverFees, fundingFees, liqMarginValue);
+                    tvResult.tradeValue = pairInfos.getTradeValuePure(
+                        t.collateral, tvResult.profitP, tvResult.rolloverFees, tvResult.fundingFees
+                    );
+
+                    isLiquidated = tvResult.tradeValue < tvResult.liqMarginValue;
                 }
 
+                if (piResult.isDynamic) {
+                    _updateDynamicSpreadVolumes(t.pairIndex, false, t.buy, t.collateral, t.leverage, pairInfos);
+                }
+
+                uint256 liquidationFee = isLiquidated ? tvResult.tradeValue : 0;
                 unregisterTrade(
-                    a.orderId, i.tradeId, t, usdcSentToTrader, usdcSentToTrader == 0 ? liqMarginValue : 0, t.collateral
+                    a.orderId, i.tradeId, t, isLiquidated ? 0 : tvResult.tradeValue, liquidationFee, t.collateral
                 );
 
                 IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
-                    a.price, t.openPrice, priceAfterImpact, i.oiNotional, t.pairIndex, t.buy, false
+                    a.price, t.openPrice, piResult.priceAfterImpact, i.oiNotional, t.pairIndex, t.buy, false
                 );
 
-                emit FeesCharged(a.orderId, i.tradeId, t.trader, rolloverFees, fundingFees);
+                emit FeesChargedV2(a.orderId, i.tradeId, t.trader, tvResult.rolloverFees, tvResult.fundingFees);
                 emit LimitCloseExecuted(
                     a.orderId,
                     i.tradeId,
-                    usdcSentToTrader == 0 ? IOstiumTradingStorage.LimitOrder.LIQ : orderType,
-                    priceAfterImpact,
-                    priceImpactP,
-                    profitP,
-                    usdcSentToTrader
+                    isLiquidated ? IOstiumTradingStorage.LimitOrder.LIQ : orderType,
+                    piResult.priceAfterImpact,
+                    piResult.priceImpactP,
+                    tvResult.profitP,
+                    isLiquidated ? 0 : tvResult.tradeValue
                 );
             }
         }
 
         if (cancelReason != CancelReason.NONE) {
-            IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
-                a.price, 0, 0, 0, t.pairIndex, false, false
-            );
             emit AutomationCloseOrderCanceled(a.orderId, i.tradeId, t.trader, t.pairIndex, orderType, cancelReason);
         }
 
@@ -448,22 +535,19 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
         storageT.unregisterPendingAutomationOrder(a.orderId);
     }
 
-    function registerTrade(uint256 tradeId, IOstiumTradingStorage.Trade memory trade, uint256 latestPrice)
-        private
-        returns (IOstiumTradingStorage.Trade memory)
-    {
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        IOstiumPairInfos pairInfos = IOstiumPairInfos(registry.getContractAddress('pairInfos'));
+    function registerTrade(
+        uint256 tradeId,
+        IOstiumTradingStorage.Trade memory trade,
+        uint256 latestPrice,
+        IOstiumTradingStorage.BuilderFee memory bf
+    ) private returns (IOstiumTradingStorage.Trade memory) {
+        (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos, IOstiumPairsStorage pairsStorage) = getContracts();
+        uint256 tradeNotional = trade.collateral.mulDiv(trade.leverage, 100, Math.Rounding.Ceil);
 
         // 2.1 Charge opening fee
         {
-            (uint256 reward, uint256 vaultReward) = storageT.handleOpeningFees(
-                trade.pairIndex,
-                latestPrice,
-                trade.collateral.mulDiv(trade.leverage, 100, Math.Rounding.Ceil),
-                trade.leverage,
-                trade.buy
-            );
+            (uint256 reward, uint256 vaultReward) =
+                storageT.handleOpeningFees(trade.pairIndex, latestPrice, tradeNotional, trade.leverage, trade.buy);
 
             trade.collateral -= reward;
 
@@ -478,6 +562,18 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
             }
         }
 
+        uint256 oracleFee = pairsStorage.pairOracleFee(trade.pairIndex);
+        storageT.handleOracleFee(oracleFee);
+        trade.collateral -= oracleFee;
+        emit OracleFeeCharged(tradeId, trade.trader, oracleFee);
+
+        if (bf.builder != address(0) && bf.builderFee > 0) {
+            uint256 builderFee = bf.builderFee * tradeNotional / PRECISION_6 / 100;
+            storageT.transferUsdc(address(storageT), bf.builder, builderFee);
+            trade.collateral -= builderFee;
+            emit BuilderFeeCharged(tradeId, trade.trader, bf.builder, builderFee);
+        }
+
         // 4. Set trade final details
         trade.index = storageT.firstEmptyTradeIndex(trade.trader, trade.pairIndex);
 
@@ -487,21 +583,19 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
 
         // 5. Call other contracts
         pairInfos.storeTradeInitialAccFees(tradeId, trade.trader, trade.pairIndex, trade.index, trade.buy);
-        IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).updateGroupCollateral(
-            trade.pairIndex, trade.collateral, trade.buy, true
-        );
+        pairsStorage.updateGroupCollateral(trade.pairIndex, trade.collateral, trade.buy, true);
 
         // 6. Store final trade in storage contract
-        uint32 currBlock = ChainUtils.getBlockNumber().toUint32();
+        uint32 currTimestamp = block.timestamp.toUint32();
         storageT.storeTrade(
             trade,
             IOstiumTradingStorage.TradeInfo(
                 tradeId,
                 trade.collateral * uint256(1e12) * trade.leverage / 100 * PRECISION_18 / trade.openPrice,
                 trade.leverage,
-                currBlock,
-                currBlock,
-                currBlock,
+                currTimestamp,
+                currTimestamp,
+                currTimestamp,
                 false
             )
         );
@@ -518,8 +612,7 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
         uint256 collateralToClose // PRECISION_6
     ) private {
         IOstiumVault vault = IOstiumVault(registry.getContractAddress('vault'));
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        IOstiumPairsStorage pairsStorage = IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
+        (IOstiumTradingStorage storageT,, IOstiumPairsStorage pairsStorage) = getContracts();
 
         pairsStorage.updateGroupCollateral(trade.pairIndex, collateralToClose, trade.buy, false);
 
@@ -529,7 +622,7 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
         // 3 USDC vault reward
         if (liquidationFee > 0) {
             storageT.transferUsdc(address(storageT), address(this), liquidationFee);
-            vault.distributeReward(liquidationFee);
+            vault.receiveAssets(liquidationFee, trade.trader);
             emit VaultLiqFeeCharged(orderId, tradeId, trade.trader, liquidationFee);
         }
 
@@ -549,9 +642,7 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
     }
 
     function handleRemoveCollateral(IOstiumPriceUpKeep.PriceUpKeepAnswer calldata a) external notDone {
-        IOstiumTradingStorage storageT = IOstiumTradingStorage(registry.getContractAddress('tradingStorage'));
-        IOstiumPairsStorage pairsStorage = IOstiumPairsStorage(registry.getContractAddress('pairsStorage'));
-        IOstiumPairInfos pairInfos = IOstiumPairInfos(registry.getContractAddress('pairInfos'));
+        (IOstiumTradingStorage storageT, IOstiumPairInfos pairInfos, IOstiumPairsStorage pairsStorage) = getContracts();
 
         IOstiumTradingStorage.PendingRemoveCollateral memory request = storageT.getPendingRemoveCollateral(a.orderId);
 
@@ -568,8 +659,11 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
         // If trade exists and market is open, check liquidation safety
         if (trade.leverage == 0) {
             cancelReason = CancelReason.NO_TRADE;
-        } else if (a.price == 0) {
+        } else if (a.price <= 0 || a.bid <= 0 || a.ask <= 0) {
             cancelReason = CancelReason.MARKET_CLOSED;
+        } else if (trade.collateral <= request.removeAmount) {
+            // Check there's enough collateral to remove to prevents division by zero or underflow when collateral was reduced by other operations
+            cancelReason = CancelReason.NOT_HIT;
         } else {
             // Calculate new leverage and position details
             uint256 tradeSize = trade.collateral.mulDiv(trade.leverage, 100, Math.Rounding.Ceil);
@@ -579,73 +673,43 @@ contract OstiumTradingCallbacks is IOstiumTradingCallbacks, Initializable {
             if (isDayTradeClosed(trade.pairIndex, trade.leverage, a.isDayTradingClosed)) {
                 cancelReason = CancelReason.DAY_TRADE_NOT_ALLOWED;
             } else {
-                (, uint256 priceAfterImpact) =
-                    TradingCallbacksLib.getTradePriceImpact(a.price, a.ask, a.bid, false, trade.buy);
-
-                (int256 profitP, int256 maxPnlP) = TradingCallbacksLib.currentPercentProfit(
-                    trade.openPrice.toInt256(),
-                    priceAfterImpact.toInt256(),
-                    trade.buy,
-                    int32(trade.leverage),
-                    int32(tradeInfo.initialLeverage)
-                );
-
-                uint32 maxLeverage =
-                    IOstiumPairsStorage(registry.getContractAddress('pairsStorage')).pairMaxLeverage(trade.pairIndex);
-                (uint256 usdcSentToTrader,,,) = pairInfos.getTradeValue(
-                    trade.trader,
-                    trade.pairIndex,
-                    trade.index,
-                    trade.buy,
-                    trade.collateral,
-                    trade.leverage,
-                    profitP,
-                    maxLeverage
-                );
-
                 cancelReason = TradingCallbacksLib.getHandleRemoveCollateralCancelReason(
-                    trade, maxLeverage, usdcSentToTrader, profitP == maxPnlP
+                    a, trade, pairInfos, pairsStorage, tradeInfo.initialLeverage
                 );
             }
         }
 
-        IOstiumOpenPnl(registry.getContractAddress('openPnl')).updateAccTotalPnl(
-            a.price, 0, 0, 0, trade.pairIndex, false, false
-        );
+        if (cancelReason == CancelReason.NONE) {
+            trade.tp = TradingCallbacksLib.correctTp(
+                trade.openPrice, trade.tp, trade.leverage, tradeInfo.initialLeverage, trade.buy
+            );
+            trade.sl = TradingCallbacksLib.correctToNullSl(
+                trade.openPrice, trade.sl, trade.leverage, tradeInfo.initialLeverage, trade.buy, maxSl_P
+            );
 
-        if (cancelReason != CancelReason.NONE) {
+            storageT.transferUsdc(address(storageT), request.trader, request.removeAmount);
+            storageT.updateTrade(trade);
+            pairsStorage.updateGroupCollateral(trade.pairIndex, request.removeAmount, trade.buy, false);
+
+            emit RemoveCollateralExecuted(
+                a.orderId,
+                tradeInfo.tradeId,
+                request.trader,
+                request.pairIndex,
+                request.removeAmount,
+                trade.leverage,
+                trade.tp,
+                trade.sl
+            );
+        } else {
             emit RemoveCollateralRejected(
                 a.orderId, tradeInfo.tradeId, request.trader, request.pairIndex, request.removeAmount, cancelReason
             );
-            storageT.unregisterPendingRemoveCollateral(a.orderId);
-            return;
         }
-
-        trade.tp = TradingCallbacksLib.correctTp(
-            trade.openPrice, trade.tp, trade.leverage, tradeInfo.initialLeverage, trade.buy
-        );
-        trade.sl = TradingCallbacksLib.correctToNullSl(
-            trade.openPrice, trade.sl, trade.leverage, tradeInfo.initialLeverage, trade.buy, maxSl_P
-        );
-
-        storageT.transferUsdc(address(storageT), request.trader, request.removeAmount);
-        storageT.updateTrade(trade);
-        pairsStorage.updateGroupCollateral(trade.pairIndex, request.removeAmount, trade.buy, false);
 
         storageT.unregisterPendingRemoveCollateral(a.orderId);
         storageT.unregisterTrigger(
             request.trader, request.pairIndex, request.index, IOstiumTradingStorage.LimitOrder.REMOVE_COLLATERAL
-        );
-
-        emit RemoveCollateralExecuted(
-            a.orderId,
-            tradeInfo.tradeId,
-            request.trader,
-            request.pairIndex,
-            request.removeAmount,
-            trade.leverage,
-            trade.tp,
-            trade.sl
         );
     }
 }

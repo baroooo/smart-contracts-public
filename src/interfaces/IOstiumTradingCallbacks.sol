@@ -118,6 +118,15 @@ interface IOstiumTradingCallbacks {
         uint256 rolloverFees,
         int256 fundingFees
     );
+    event FeesChargedV2(
+        uint256 indexed orderId,
+        uint256 indexed tradeId,
+        address indexed trader,
+        int256 rolloverFees,
+        int256 fundingFees
+    );
+    event BuilderFeeCharged(uint256 indexed tradeId, address indexed trader, address indexed builder, uint256 amount);
+    event OracleFeeRefunded(uint256 indexed tradeId, address indexed trader, uint16 pairIndex, uint256 amount);
 
     error IsDone();
     error IsPaused();

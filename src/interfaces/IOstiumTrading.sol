@@ -11,7 +11,9 @@ interface IOstiumTrading {
         NO_TRADE,
         NO_SL,
         NO_TP,
-        SUCCESS
+        SUCCESS,
+        PAUSED,
+        BACKDATED_EXECUTION
     }
 
     event Done(bool done);
@@ -106,6 +108,7 @@ interface IOstiumTrading {
     error NoLimitFound(address trader, uint16 pairIndex, uint8 index);
     error AlreadyMarketClosed(address trader, uint16 pairIndex, uint8 index);
     error TriggerPending(address sender, uint16 pairIndex, uint8 index);
+    error BelowFees();
 
     function isDone() external view returns (bool);
     function isPaused() external view returns (bool);
@@ -115,10 +118,17 @@ interface IOstiumTrading {
 
     function openTrade(
         IOstiumTradingStorage.Trade calldata t,
+        IOstiumTradingStorage.BuilderFee calldata bf,
         IOstiumTradingStorage.OpenOrderType orderType,
         uint256 slippageP
     ) external;
-    function closeTradeMarket(uint16 pairIndex, uint8 index, uint16 closePercentage) external;
+    function closeTradeMarket(
+        uint16 pairIndex,
+        uint8 index,
+        uint16 closePercentage,
+        uint192 marketPrice,
+        uint32 slippageP
+    ) external;
     function updateOpenLimitOrder(uint16 pairIndex, uint8 index, uint192 price, uint192 tp, uint192 sl) external;
     function cancelOpenLimitOrder(uint16 pairIndex, uint8 index) external;
     function updateTp(uint16 pairIndex, uint8 index, uint192 newTp) external;
@@ -126,13 +136,6 @@ interface IOstiumTrading {
     function topUpCollateral(uint16 pairIndex, uint8 index, uint256 topUpAmount) external;
     function openTradeMarketTimeout(uint256 _order) external;
     function closeTradeMarketTimeout(uint256 _order, bool retry) external;
-    function checkNoPendingTrigger(
-        address trader,
-        uint16 pairIndex,
-        uint8 index,
-        IOstiumTradingStorage.LimitOrder orderType
-    ) external view returns (bool);
-    function checkNoPendingTriggers(address trader, uint16 pairIndex, uint8 index) external view returns (bool);
 
     // only tradesUpKeep
     function executeAutomationOrder(
