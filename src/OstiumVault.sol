@@ -40,17 +40,18 @@ contract OstiumVault is IOstiumVault, ERC4626Upgradeable {
     uint16 public maxDiscountThresholdP; // PRECISION_2 (%)
     uint16 public maxSupplyIncreaseDailyP; // PRECISION_2 (% per day)
     uint16[2] public withdrawLockThresholdsP; // PRECISION_2
-
-    uint256 public shareToAssetsPrice; // BREAKING: swapped with currentMaxSupply
-    uint256 public currentMaxSupply; // BREAKING: swapped with shareToAssetsPrice
+    uint256 public shareToAssetsPrice;
+    uint256 public currentMaxSupply;
     uint256 public accRewardsPerToken;
     uint256 public lockedDepositsCount;
     uint256 public maxAccOpenPnlDeltaPerToken;
     uint256 public maxDailyAccPnlDeltaPerToken;
     uint256 public currentEpochPositiveOpenPnl;
 
+    int256 public accPnlPerToken;
     int256 public accPnlPerTokenUsed; // (snapshot of accPnlPerToken)
     int256 public dailyAccPnlDeltaPerToken;
+    uint256 public temp;
 
     uint256 public totalDeposited; // Obsolete
     int256 public totalClosedPnl;
